@@ -1610,7 +1610,7 @@ neurinspectre recommend-countermeasures   --threat-level critical   --attack-vec
 
 **NeurInSpectre** implements a novel three-layer mathematical framework for gradient obfuscation detection that advances the state-of-the-art by combining signal processing, fractional calculus, and numerical analysis. This approach transforms obfuscation detection from heuristic pattern matching into a rigorous mathematical characterization problem.
 
-### Visual overview (Figures 1, 3, 7)
+### Visual overview
 
 <p align="center">
   <img src="figures/neurinspectre_architecture.png" alt="Figure 1: Three-layer architecture (Spectral → Volterra → Krylov)" width="720"/>
