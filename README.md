@@ -218,10 +218,10 @@ Traditional blue teams monitor API calls and output statistics. NeurInSpectre en
 - [Advanced Security Modules](#advanced-security-modules)
 - [Active Dashboard Ecosystem](#active-dashboard-ecosystem)
 - [Command Line Interface](#command-line-interface)
-  - [Attack CLI Usage (Paper-Aligned, Real Output)](#attack-cli-paper-aligned-real-output)
+  - [Attack CLI Usage](#attack-cli-output)
   - [Section 1 - Offensive Kill Chain](#section-1--offensive-kill-chain)
   - [Section 2 - Signal-to-Action Mapping (Characterization)](#section-2--signal-to-action-mapping-characterization)
-  - [Section 3 - Compare Modes (Real Output)](#section-3--compare-modes-real-output)
+  - [Section 3 - Compare Modes](#section-3--compare-modes-output)
   - [Section 4 - Signal-to-Action Mapping (Evaluation/Regression)](#section-4--signal-to-action-mapping-evaluation-regression)
   - [Section 5 - WOOT AEC Compliance](#section-5--woot-aec-compliance)
 - [AttentionGuard transformer anomaly analysis](#attentionguard-transformer-anomaly-analysis)
@@ -435,7 +435,7 @@ neurinspectre characterize \
 
 Cross-ref: Paper Section 5.1 "Experimental Setup"
 
-### Table 1 Evaluation (Real Data)
+### Table 1 Evaluation
 
 ```bash
 # Full evaluation (all 12 defenses)
@@ -477,7 +477,7 @@ python mac_silicon_test.py
 # Launch TTD dashboard with model switching
 neurinspectre dashboard --model gpt2 --port 8080
 
-# With real data files
+# With data files
 neurinspectre dashboard --model gpt2 --port 8080 --attention-file real_attention.npy --batch-dir sample_upload_test_files
 
 # Open browser to http://localhost:8080
@@ -2545,7 +2545,7 @@ neurinspectre dashboard-manager start --dashboard ttd
 ```
 
 ```bash
-# Paper-aligned attack workflow (real CLI outputs referenced below)
+# attack workflow (real CLI outputs referenced below)
 neurinspectre characterize \
   --model _cli_runs/cifar10_resnet20_norm_ts.pt \
   --dataset cifar10 \
@@ -2564,9 +2564,9 @@ neurinspectre compare --mode baseline evaluation_results/summary.json
 neurinspectre compare --mode characterization char_results/*.json --sort-by alpha
 ```
 
-<a id="attack-cli-paper-aligned-real-output"></a>
+<a id="attack-cli-real-output"></a>
 
-### 🔴 Attack CLI Usage (Paper-Aligned, Real Output)
+### 🔴 Attack CLI Usage 
 
 This section is grounded in real CLI output captured in the screenshots. It uses the exact commands and outputs shown there, so you can copy/paste and validate without relying on synthetic examples.
 
