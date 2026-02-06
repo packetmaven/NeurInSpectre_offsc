@@ -3620,12 +3620,12 @@ open _cli_runs/attention_gradient_alignment.html
 - **Y-axis** = transformer layer index (or the selected layer range)
 - **X-axis** = attention head index
 - **Each cell** = cosine similarity between two flattened matrices:
-  - `A[l,h]` = attention probability matrix for (layer `l`, head `h`)
-  - `dJ/dA[l,h]` = gradient of the chosen scalar objective `J` with respect to that attention matrix
+  - $A[l,h]$ = attention probability matrix for (layer $l$, head $h$)
+  - $\partial J / \partial A[l,h]$ = gradient of the chosen scalar objective $J$ with respect to that attention matrix
 
 Definition (informal):
 
-`AGA(l,h) = cos( vec(A[l,h]), vec(dJ/dA[l,h]) )`
+$$AGA(l,h) = \cos(\mathrm{vec}(A[l,h]), \mathrm{vec}(\partial J / \partial A[l,h]))$$
 
 **Interpretation**:
 - **Red (positive)**: gradient is aligned with the current attention pattern (the objective is most sensitive *in the same directions the head already attends*)
