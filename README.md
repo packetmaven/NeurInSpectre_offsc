@@ -16,7 +16,7 @@
 
 ---
 
-# NeurInSpectre4
+# NeurInSpectre
 <a id="tldr"></a>
 
 ## TL;DR
