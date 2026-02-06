@@ -1613,15 +1613,15 @@ neurinspectre recommend-countermeasures   --threat-level critical   --attack-vec
 ### Visual overview
 
 <p align="center">
-  <img src="figures/neurinspectre_architecture.png" alt="Figure 1: Three-layer architecture (Spectral → Volterra → Krylov)" width="720"/>
+  <img src="neurinspectre_architecture.png" alt="Figure 1: Three-layer architecture (Spectral → Volterra → Krylov)" width="720"/>
 </p>
 
 <p align="center">
-  <img src="figures/volterra_kernels.png" alt="Figure 3: Power-law vs. exponential vs. Matérn memory kernels" width="720"/>
+  <img src="volterra_kernels.png" alt="Figure 3: Power-law vs. exponential vs. Matérn memory kernels" width="720"/>
 </p>
 
 <p align="center">
-  <img src="figures/cross_layer_detection.png" alt="Figure 7: Cross-layer detection summary (spectral, Volterra, Krylov, ensemble)" width="720"/>
+  <img src="cross_layer_detection.png" alt="Figure 7: Cross-layer detection summary (spectral, Volterra, Krylov, ensemble)" width="720"/>
 </p>
 
 <details>
