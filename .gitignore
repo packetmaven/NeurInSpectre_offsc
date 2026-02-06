@@ -226,6 +226,7 @@ results/
 *.png
 !NeurInSpectre2.png
 !docs/examples/*.png
+!docs/examples/**/*.png
 *.pcap
 *.jpg
 *.jpeg
