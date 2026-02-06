@@ -1645,15 +1645,11 @@ The framework operates on three complementary mathematical layers, each targetin
 
 Given a gradient sequence $g = \{g_0, g_1, \ldots, g_{N-1}\}$, compute the discrete Fourier transform:
 
-<p align="center">
-  <img src="docs/examples/math/eq-001.png" alt="Equation 1"/>
-</p>
+$$G_k = \sum_{n=0}^{N-1} g_n \cdot e^{-2\pi i k n / N}, \quad k = 0, 1, \ldots, N-1$$
 
 The power spectral density is then:
 
-<p align="center">
-  <img src="docs/examples/math/eq-002.png" alt="Equation 2"/>
-</p>
+$$S(f_k) = \frac{|G_k|^2}{N}$$
 
 **Implementation** (`neurinspectre/security/adversarial_detection.py`):
 ```python
@@ -1666,9 +1662,7 @@ psd = np.abs(fftshift(yf))**2 / n
 
 Quantifies the disorder in the frequency distribution. For a normalized PSD $\tilde{S}(f) = S(f) / \sum_f S(f)$:
 
-<p align="center">
-  <img src="docs/examples/math/eq-003.png" alt="Equation 3"/>
-</p>
+$$H(S) = -\sum_{k} \tilde{S}(f_k) \log_2 \tilde{S}(f_k)$$
 
 **Detection Principle:**
 - **Clean gradients:** Energy concentrated in low frequencies → **low entropy** (H < 0.5)
@@ -1676,9 +1670,7 @@ Quantifies the disorder in the frequency distribution. For a normalized PSD $\ti
 
 **Normalized entropy** (scale-invariant):
 
-<p align="center">
-  <img src="docs/examples/math/eq-004.png" alt="Equation 4"/>
-</p>
+$$\hat{H}(S) = \frac{H(S)}{\log_2 N}$$
 
 **Implementation** (`neurinspectre/security/adversarial_detection.py`):
 ```python
@@ -1692,9 +1684,7 @@ if normalize:
 
 Measures the proportion of energy above a threshold frequency $f_\theta$ (default: Nyquist/4):
 
-<p align="center">
-  <img src="docs/examples/math/eq-005.png" alt="Equation 5"/>
-</p>
+$$R_{HF} = \frac{\sum_{|f| \geq f_\theta} S(f)}{\sum_{f} S(f)}$$
 
 **Attack Signatures:**
 
@@ -1709,15 +1699,11 @@ Measures the proportion of energy above a threshold frequency $f_\theta$ (defaul
 
 For time-localized frequency analysis, NeurInSpectre employs the Continuous Wavelet Transform with Morlet wavelets:
 
-<p align="center">
-  <img src="docs/examples/math/eq-006.png" alt="Equation 6"/>
-</p>
+$$\psi(t) = e^{i\omega_0 t} \cdot e^{-t^2/2}$$
 
 The CWT at scale $a$ and translation $b$:
 
-<p align="center">
-  <img src="docs/examples/math/eq-007.png" alt="Equation 7"/>
-</p>
+$$W_g(a, b) = \frac{1}{\sqrt{a}} \int_{-\infty}^{\infty} g(t) \cdot \psi^*\left(\frac{t-b}{a}\right) dt$$
 
 **Implementation** (`neurinspectre/visualization/attention_gradient_alignment.py` and `neurinspectre/core/corner_case_detection/temporal_evolution.py`):
 ```python
@@ -1731,9 +1717,7 @@ for i, scale in enumerate(scales):
 
 **Wavelet energy per scale:**
 
-<p align="center">
-  <img src="docs/examples/math/eq-008.png" alt="Equation 8"/>
-</p>
+$$E_a = \frac{1}{N} \sum_{b} |W_g(a, b)|^2$$
 
 ---
 
@@ -1747,9 +1731,7 @@ for i, scale in enumerate(scales):
 
 Model the gradient sequence as the solution to:
 
-<p align="center">
-  <img src="docs/examples/math/eq-009.png" alt="Equation 9"/>
-</p>
+$$y(t) = f(t) + \int_0^t K(t, s) \cdot y(s) \, ds$$
 
 Where:
 - $y(t)$: Observed gradient state at time $t$
@@ -1762,9 +1744,7 @@ NeurInSpectre implements three kernel types, each targeting different obfuscatio
 
 **Power-Law Kernel (Fractional Dynamics):**
 
-<p align="center">
-  <img src="docs/examples/math/eq-010.png" alt="Equation 10"/>
-</p>
+$$K(t, s) = \frac{c \cdot (t - s)^{\alpha - 1}}{\Gamma(\alpha)}, \quad 0 < \alpha < 1$$
 
 - **Physical interpretation:** Subdiffusive memory decay (heavy-tailed temporal correlations)
 - **Detection target:** RL-trained obfuscation exhibits $\alpha \to 0$ (strong memory)
@@ -1779,18 +1759,14 @@ return c * (t - s) ** (alpha - 1) / gamma(alpha)
 
 **Exponential Kernel (Markovian Decay):**
 
-<p align="center">
-  <img src="docs/examples/math/eq-011.png" alt="Equation 11"/>
-</p>
+$$K(t, s) = e^{-\lambda (t - s)}$$
 
 - **Detection target:** Gradient clipping and normalization attacks
 - **Parameter $\lambda$:** Decay rate (higher = shorter memory)
 
 **Matérn Kernel (Smooth Memory):**
 
-<p align="center">
-  <img src="docs/examples/math/eq-012.png" alt="Equation 12"/>
-</p>
+$$K(t, s) = \frac{2^{1-\nu}}{\Gamma(\nu)} \left( \frac{\sqrt{2\nu} \cdot d}{\rho} \right)^\nu e^{-\sqrt{2\nu} \cdot d / \rho}, \quad d = t - s$$
 
 - **Parameter $\nu$:** Smoothness (controls differentiability of sample paths)
 - **Detection target:** Adversarial smoothing attacks
@@ -1799,9 +1775,7 @@ return c * (t - s) ** (alpha - 1) / gamma(alpha)
 
 The Volterra equation is solved using the trapezoid rule with $N$ discretization points:
 
-<p align="center">
-  <img src="docs/examples/math/eq-013.png" alt="Equation 13"/>
-</p>
+$$y_i = f(t_i) + \Delta t \sum_{j=0}^{i-1} \frac{K(t_i, t_j) y_j + K(t_i, t_{j+1}) y_j}{2}$$
 
 **Implementation** (`neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1818,9 +1792,7 @@ for i in range(1, n_points):
 
 Kernel parameters $\theta = (\alpha, c)$ are estimated by minimizing reconstruction error:
 
-<p align="center">
-  <img src="docs/examples/math/eq-014.png" alt="Equation 14"/>
-</p>
+$$\hat{\theta} = \arg\min_\theta \sqrt{\frac{1}{N} \sum_{i=1}^N (y_i^{\text{obs}} - y_i^{\text{pred}}(\theta))^2}$$
 
 **Implementation** (`neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1853,9 +1825,7 @@ result = minimize(
 
 Model gradient evolution as a stiff semilinear ODE:
 
-<p align="center">
-  <img src="docs/examples/math/eq-015.png" alt="Equation 15"/>
-</p>
+$$\frac{\partial u}{\partial t} = Lu + N(u, t)$$
 
 Where:
 - $u(t) \in \mathbb{R}^N$: Gradient state vector
@@ -1864,23 +1834,17 @@ Where:
 
 **Linear Operator (Discrete Laplacian):**
 
-<p align="center">
-  <img src="docs/examples/math/eq-016.png" alt="Equation 16"/>
-</p>
+$$L = \begin{pmatrix} -2 & 1 & 0 & \cdots \\ 1 & -2 & 1 & \cdots \\ \vdots & \ddots & \ddots & \ddots \end{pmatrix}$$
 
 #### 3.2 Exponential Time Differencing (ETD2 Scheme)
 
 Direct integration of stiff systems is numerically unstable. ETD methods integrate the linear part **exactly** using matrix exponentials:
 
-<p align="center">
-  <img src="docs/examples/math/eq-017.png" alt="Equation 17"/>
-</p>
+$$u_{n+1} = e^{\Delta t L} u_n + \Delta t \cdot \varphi_1(\Delta t L) \cdot N_n + \Delta t \cdot \varphi_2(\Delta t L) \cdot (N_{n+1} - N_n)$$
 
 **φ-functions (entire functions):**
 
-<p align="center">
-  <img src="docs/examples/math/eq-018.png" alt="Equation 18"/>
-</p>
+$$\varphi_1(z) = \frac{e^z - 1}{z}, \quad \varphi_2(z) = \frac{\varphi_1(z) - 1}{z} = \frac{e^z - 1 - z}{z^2}$$
 
 **Implementation** (`neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1902,9 +1866,7 @@ def _compute_phi2(self, A):
 
 **Solution:** Arnoldi iteration to project onto a low-dimensional Krylov subspace:
 
-<p align="center">
-  <img src="docs/examples/math/eq-019.png" alt="Equation 19"/>
-</p>
+$$\mathcal{K}_m(L, v) = \text{span}\{v, Lv, L^2 v, \ldots, L^{m-1} v\}$$
 
 **Arnoldi Iteration (Modified Gram-Schmidt):**
 
@@ -1937,9 +1899,7 @@ for j in range(m):
 
 **Matrix Exponential Approximation:**
 
-<p align="center">
-  <img src="docs/examples/math/eq-020.png" alt="Equation 20"/>
-</p>
+$$e^{\Delta t L} v \approx \|v\| \cdot V_m \cdot e^{\Delta t H_m} \cdot e_1$$
 
 Where $H_m \in \mathbb{R}^{m \times m}$ is the upper Hessenberg matrix and $e_1 = [1, 0, \ldots, 0]^T$.
 
@@ -2003,9 +1963,7 @@ features = {
 
 #### Composite Detection Score
 
-<p align="center">
-  <img src="docs/examples/math/eq-021.png" alt="Equation 21"/>
-</p>
+$$\text{score} = w_1 \cdot H(S) + w_2 \cdot R_{HF} + w_3 \cdot (1 - \alpha_V) + w_4 \cdot \text{RMSE}_V$$
 
 #### Decision Logic
 
