@@ -1643,17 +1643,17 @@ The framework operates on three complementary mathematical layers, each targetin
 
 #### 1.1 Power Spectral Density Estimation
 
-Given a gradient sequence $ g = \{g_0, g_1, \ldots, g_{N-1}\} $, compute the discrete Fourier transform:
+Given a gradient sequence $g = \{g_0, g_1, \ldots, g_{N-1}\}$, compute the discrete Fourier transform:
 
-$$
+```math
 G_k = \sum_{n=0}^{N-1} g_n \cdot e^{-2\pi i k n / N}, \quad k = 0, 1, \ldots, N-1
-$$
+```
 
 The power spectral density is then:
 
-$$
+```math
 S(f_k) = \frac{|G_k|^2}{N}
-$$
+```
 
 **Implementation** (`neurinspectre/security/adversarial_detection.py`):
 ```python
@@ -1664,11 +1664,11 @@ psd = np.abs(fftshift(yf))**2 / n
 
 #### 1.2 Spectral Entropy
 
-Quantifies the disorder in the frequency distribution. For a normalized PSD $ \tilde{S}(f) = S(f) / \sum_f S(f) $:
+Quantifies the disorder in the frequency distribution. For a normalized PSD $\tilde{S}(f) = S(f) / \sum_f S(f)$:
 
-$$
+```math
 H(S) = -\sum_{k} \tilde{S}(f_k) \log_2 \tilde{S}(f_k)
-$$
+```
 
 **Detection Principle:**
 - **Clean gradients:** Energy concentrated in low frequencies → **low entropy** (H < 0.5)
@@ -1676,9 +1676,9 @@ $$
 
 **Normalized entropy** (scale-invariant):
 
-$$
+```math
 \hat{H}(S) = \frac{H(S)}{\log_2 N}
-$$
+```
 
 **Implementation** (`neurinspectre/security/adversarial_detection.py`):
 ```python
@@ -1690,11 +1690,11 @@ if normalize:
 
 #### 1.3 High-Frequency Energy Ratio
 
-Measures the proportion of energy above a threshold frequency $ f_\theta $ (default: Nyquist/4):
+Measures the proportion of energy above a threshold frequency $f_\theta$ (default: Nyquist/4):
 
-$$
+```math
 R_{HF} = \frac{\sum_{|f| \geq f_\theta} S(f)}{\sum_{f} S(f)}
-$$
+```
 
 **Attack Signatures:**
 
@@ -1709,15 +1709,15 @@ $$
 
 For time-localized frequency analysis, NeurInSpectre employs the Continuous Wavelet Transform with Morlet wavelets:
 
-$$
+```math
 \psi(t) = e^{i\omega_0 t} \cdot e^{-t^2/2}
-$$
+```
 
-The CWT at scale $ a $ and translation $ b $:
+The CWT at scale $a$ and translation $b$:
 
-$$
+```math
 W_g(a, b) = \frac{1}{\sqrt{a}} \int_{-\infty}^{\infty} g(t) \cdot \psi^*\left(\frac{t-b}{a}\right) dt
-$$
+```
 
 **Implementation** (`neurinspectre/visualization/attention_gradient_alignment.py` and `neurinspectre/core/corner_case_detection/temporal_evolution.py`):
 ```python
@@ -1731,9 +1731,9 @@ for i, scale in enumerate(scales):
 
 **Wavelet energy per scale:**
 
-$$
+```math
 E_a = \frac{1}{N} \sum_{b} |W_g(a, b)|^2
-$$
+```
 
 ---
 
@@ -1747,14 +1747,14 @@ $$
 
 Model the gradient sequence as the solution to:
 
-$$
+```math
 y(t) = f(t) + \int_0^t K(t, s) \cdot y(s) \, ds
-$$
+```
 
 Where:
-- $ y(t) $: Observed gradient state at time $ t $
-- $ f(t) $: Forcing function (clean gradient component)
-- $ K(t, s) $: **Memory kernel** encoding how past gradients at time $ s $ influence the present
+- $y(t)$: Observed gradient state at time $t$
+- $f(t)$: Forcing function (clean gradient component)
+- $K(t, s)$: **Memory kernel** encoding how past gradients at time $s$ influence the present
 
 #### 2.2 Memory Kernel Functions
 
@@ -1762,13 +1762,13 @@ NeurInSpectre implements three kernel types, each targeting different obfuscatio
 
 **Power-Law Kernel (Fractional Dynamics):**
 
-$$
+```math
 K(t, s) = \frac{c \cdot (t - s)^{\alpha - 1}}{\Gamma(\alpha)}, \quad 0 < \alpha < 1
-$$
+```
 
 - **Physical interpretation:** Subdiffusive memory decay (heavy-tailed temporal correlations)
-- **Detection target:** RL-trained obfuscation exhibits $ \alpha \to 0 $ (strong memory)
-- **Clean gradients:** $ \alpha \approx 1 $ (nearly memoryless)
+- **Detection target:** RL-trained obfuscation exhibits $\alpha \to 0$ (strong memory)
+- **Clean gradients:** $\alpha \approx 1$ (nearly memoryless)
 
 **Implementation** (`neurinspectre/mathematical/advanced_mathematical_foundations.py` and `neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1779,29 +1779,29 @@ return c * (t - s) ** (alpha - 1) / gamma(alpha)
 
 **Exponential Kernel (Markovian Decay):**
 
-$$
+```math
 K(t, s) = e^{-\lambda (t - s)}
-$$
+```
 
 - **Detection target:** Gradient clipping and normalization attacks
-- **Parameter $ \lambda $:** Decay rate (higher = shorter memory)
+- **Parameter $\lambda$:** Decay rate (higher = shorter memory)
 
 **Matérn Kernel (Smooth Memory):**
 
-$$
+```math
 K(t, s) = \frac{2^{1-\nu}}{\Gamma(\nu)} \left( \frac{\sqrt{2\nu} \cdot d}{\rho} \right)^\nu e^{-\sqrt{2\nu} \cdot d / \rho}, \quad d = t - s
-$$
+```
 
-- **Parameter $ \nu $:** Smoothness (controls differentiability of sample paths)
+- **Parameter $\nu$:** Smoothness (controls differentiability of sample paths)
 - **Detection target:** Adversarial smoothing attacks
 
 #### 2.3 Numerical Solution
 
-The Volterra equation is solved using the trapezoid rule with $ N $ discretization points:
+The Volterra equation is solved using the trapezoid rule with $N$ discretization points:
 
-$$
+```math
 y_i = f(t_i) + \Delta t \sum_{j=0}^{i-1} \frac{K(t_i, t_j) y_j + K(t_i, t_{j+1}) y_j}{2}
-$$
+```
 
 **Implementation** (`neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1816,11 +1816,11 @@ for i in range(1, n_points):
 
 #### 2.4 Parameter Estimation via L-BFGS-B
 
-Kernel parameters $ \theta = (\alpha, c) $ are estimated by minimizing reconstruction error:
+Kernel parameters $\theta = (\alpha, c)$ are estimated by minimizing reconstruction error:
 
-$$
+```math
 \hat{\theta} = \arg\min_\theta \sqrt{\frac{1}{N} \sum_{i=1}^N (y_i^{\text{obs}} - y_i^{\text{pred}}(\theta))^2}
-$$
+```
 
 **Implementation** (`neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1837,9 +1837,9 @@ result = minimize(
 
 | Feature | Formula | Obfuscation Indicator |
 |---------|---------|----------------------|
-| `volterra_rmse` | $ \sqrt{\text{MSE}(y^{\text{obs}}, y^{\text{pred}})} $ | High RMSE → poor fit → obfuscation |
-| `volterra_alpha` | Fitted $ \alpha $ parameter | $ \alpha < 0.7 $ → non-Markovian → obfuscation |
-| `volterra_c` | Fitted $ c $ parameter | Memory strength indicator |
+| `volterra_rmse` | $\sqrt{\text{MSE}(y^{\text{obs}}, y^{\text{pred}})}$ | High RMSE → poor fit → obfuscation |
+| `volterra_alpha` | Fitted $\alpha$ parameter | $\alpha < 0.7$ → non-Markovian → obfuscation |
+| `volterra_c` | Fitted $c$ parameter | Memory strength indicator |
 
 ---
 
@@ -1853,38 +1853,38 @@ result = minimize(
 
 Model gradient evolution as a stiff semilinear ODE:
 
-$$
+```math
 \frac{\partial u}{\partial t} = Lu + N(u, t)
-$$
+```
 
 Where:
-- $ u(t) \in \mathbb{R}^N $: Gradient state vector
-- $ L $: Linear operator (discrete Laplacian for diffusion)
-- $ N(u, t) $: Nonlinear term modeling obfuscation effects
+- $u(t) \in \mathbb{R}^N$: Gradient state vector
+- $L$: Linear operator (discrete Laplacian for diffusion)
+- $N(u, t)$: Nonlinear term modeling obfuscation effects
 
 **Linear Operator (Discrete Laplacian):**
 
-$$
+```math
 L = \begin{pmatrix}
 -2 & 1 & 0 & \cdots \\
 1 & -2 & 1 & \cdots \\
 \vdots & \ddots & \ddots & \ddots
 \end{pmatrix}
-$$
+```
 
 #### 3.2 Exponential Time Differencing (ETD2 Scheme)
 
 Direct integration of stiff systems is numerically unstable. ETD methods integrate the linear part **exactly** using matrix exponentials:
 
-$$
+```math
 u_{n+1} = e^{\Delta t L} u_n + \Delta t \cdot \varphi_1(\Delta t L) \cdot N_n + \Delta t \cdot \varphi_2(\Delta t L) \cdot (N_{n+1} - N_n)
-$$
+```
 
 **φ-functions (entire functions):**
 
-$$
+```math
 \varphi_1(z) = \frac{e^z - 1}{z}, \quad \varphi_2(z) = \frac{\varphi_1(z) - 1}{z} = \frac{e^z - 1 - z}{z^2}
-$$
+```
 
 **Implementation** (`neurinspectre/mathematical/gpu_accelerated_math.py`):
 ```python
@@ -1902,13 +1902,13 @@ def _compute_phi2(self, A):
 
 #### 3.3 Krylov Subspace Approximation
 
-**Problem:** Computing $ e^{\Delta t L} v $ for large $ L \in \mathbb{R}^{N \times N} $ is $ O(N^3) $—intractable.
+**Problem:** Computing $e^{\Delta t L} v$ for large $L \in \mathbb{R}^{N \times N}$ is $O(N^3)$—intractable.
 
 **Solution:** Arnoldi iteration to project onto a low-dimensional Krylov subspace:
 
-$$
+```math
 \mathcal{K}_m(L, v) = \text{span}\{v, Lv, L^2 v, \ldots, L^{m-1} v\}
-$$
+```
 
 **Arnoldi Iteration (Modified Gram-Schmidt):**
 
@@ -1941,28 +1941,28 @@ for j in range(m):
 
 **Matrix Exponential Approximation:**
 
-$$
+```math
 e^{\Delta t L} v \approx \|v\| \cdot V_m \cdot e^{\Delta t H_m} \cdot e_1
-$$
+```
 
-Where $ H_m \in \mathbb{R}^{m \times m} $ is the upper Hessenberg matrix and $ e_1 = [1, 0, \ldots, 0]^T $.
+Where $H_m \in \mathbb{R}^{m \times m}$ is the upper Hessenberg matrix and $e_1 = [1, 0, \ldots, 0]^T$.
 
 **Complexity Analysis:**
 
 | Method | Complexity | NeurInSpectre (m=30, N=10⁶) |
 |--------|------------|----------------------------|
-| Direct $ e^{\Delta t L} $ | $ O(N^3) $ | 10¹⁸ ops — **intractable** |
-| Krylov approximation | $ O(mN) + O(m^3) $ | 3×10⁷ ops — **tractable** |
+| Direct $e^{\Delta t L}$ | $O(N^3)$ | 10¹⁸ ops — **intractable** |
+| Krylov approximation | $O(mN) + O(m^3)$ | 3×10⁷ ops — **tractable** |
 
 #### 3.4 Nonlinear Terms by Attack Type
 
-| Attack | $ N(u, t) $ | Physical Effect |
+| Attack | $N(u, t)$ | Physical Effect |
 |--------|----------------|-----------------|
-| Clean | $ 0 $ | Pure diffusion |
-| Shattered | $ \sigma \cdot \xi(t) $ | White noise forcing |
-| Vanishing | $ -\gamma u $ | Exponential decay |
-| Exploding | $ +\beta u^3 $ | Cubic instability |
-| Stochastic | $ \eta(t) \cdot \sin(2\pi t) $ | Time-varying noise |
+| Clean | $0$ | Pure diffusion |
+| Shattered | $\sigma \cdot \xi(t)$ | White noise forcing |
+| Vanishing | $-\gamma u$ | Exponential decay |
+| Exploding | $+\beta u^3$ | Cubic instability |
+| Stochastic | $\eta(t) \cdot \sin(2\pi t)$ | Time-varying noise |
 
 **Implementation** (`neurinspectre/security/evasion_detection.py` and `neurinspectre/security/integrated_security.py`):
 ```python
@@ -2007,9 +2007,9 @@ features = {
 
 #### Composite Detection Score
 
-$$
+```math
 \text{score} = w_1 \cdot H(S) + w_2 \cdot R_{HF} + w_3 \cdot (1 - \alpha_V) + w_4 \cdot \text{RMSE}_V
-$$
+```
 
 #### Decision Logic
 
@@ -2028,7 +2028,7 @@ is_obfuscated = (
 | Innovation | Prior Art | NeurInSpectre Advance |
 |------------|-----------|----------------------|
 | Memory modeling | None (point-wise analysis) | Volterra integral equations with learnable kernels |
-| Stiff PDE integration | Standard Euler/RK | ETD2 + Krylov for $ O(mN) $ complexity |
+| Stiff PDE integration | Standard Euler/RK | ETD2 + Krylov for $O(mN)$ complexity |
 | Spectral analysis | Simple FFT thresholds | Multi-scale wavelets + entropy + slope |
 | Multi-layer detection | Single-feature detectors | 25+ features across 3 complementary layers |
 
@@ -2042,7 +2042,7 @@ is_obfuscated = (
 
 ---
 
-**🔴 Red Team Advisory:** Each detection layer has exploitable blind spots. Spectral analysis can be evaded with band-limited noise ($ f < 0.25 f_s $). Krylov methods can be fooled by perturbations orthogonal to the $ m $-dimensional subspace. Volterra detection can be masked with artificial Markovian dynamics (exponential decay injection).
+**🔴 Red Team Advisory:** Each detection layer has exploitable blind spots. Spectral analysis can be evaded with band-limited noise ($f < 0.25 f_s$). Krylov methods can be fooled by perturbations orthogonal to the $m$-dimensional subspace. Volterra detection can be masked with artificial Markovian dynamics (exponential decay injection).
 
 **🔵 Blue Team Advisory:** Deploy all three layers for defense-in-depth. Cross-validate between spectral anomalies and Volterra memory features. Monitor for adversarial adaptation by tracking detection confidence over time.
 
