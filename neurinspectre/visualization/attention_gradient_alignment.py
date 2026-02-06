@@ -1,4 +1,4 @@
-"""Attention-Gradient Alignment (AGA) visualization.
+r"""Attention-Gradient Alignment (AGA) visualization.
 
 AGA is a **heuristic diagnostic**: for each attention head, compute a cosine similarity between
 the attention weights and the gradient of a scalar objective w.r.t. those weights.

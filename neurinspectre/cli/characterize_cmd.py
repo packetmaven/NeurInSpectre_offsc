@@ -191,6 +191,7 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
     no_color = bool(kwargs.get("no_color", False))
     force_color = bool(kwargs.get("color", False))
     brief = bool(kwargs.get("brief", False))
+    summary_only = bool(kwargs.get("summary_only", False))
     console = build_console(no_color=no_color, force_color=force_color)
 
     show_progress = not no_progress and not quiet
@@ -309,6 +310,7 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
             ),
             report_format=report_format,
             brief=brief,
+            summary_only=summary_only,
         )
 
     # -------------------------------------------------------------------

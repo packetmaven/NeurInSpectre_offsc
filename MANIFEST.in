@@ -4,6 +4,7 @@ include LICENSE
 recursive-include attack_data *.npy *.json
 recursive-include neurinspectre *.py
 recursive-include configs *.yaml
+recursive-include experiments/configs *.yaml
 global-exclude __pycache__
 global-exclude *.py[co]
 global-exclude *.log

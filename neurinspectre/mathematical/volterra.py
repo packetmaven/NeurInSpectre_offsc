@@ -1,13 +1,18 @@
 """
 Volterra memory analysis (Layer 2).
 
-This module implements a proof-of-concept Volterra integral equation fit consistent with the
-NeurInSpectre three-layer framework described in the project README and the Packetmaven blog.
+This module implements Volterra integral equation tooling consistent with the
+NeurInSpectre framework and the Packetmaven Volterra discussion.
 
 Primary output features:
 - volterra_alpha: fitted power-law memory exponent (0 < alpha < 1)
 - volterra_c: fitted kernel strength (c > 0)
 - volterra_rmse: fit error between observed and predicted series
+
+Additional utilities:
+- VolterraKernel classes (power_law, exponential, uniform)
+- fit_volterra_kernel for kernel fitting on gradient history
+- compute_volterra_correlation for temporal autocorrelation analysis
 """
 
 from __future__ import annotations
@@ -15,7 +20,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple
 
+import warnings
+
 import numpy as np
+from scipy import special
+from scipy.optimize import differential_evolution, minimize
 
 
 VolterraNormalize = Literal["none", "by_y0", "by_mean", "by_median", "by_rms"]
@@ -37,6 +46,305 @@ class VolterraFitResult:
     message: str
     nit: int
     nfev: int
+
+
+class VolterraKernel:
+    """
+    Base class for Volterra memory kernels.
+
+    A kernel K(t,s) defines how the state at time s influences time t.
+    Different kernel types capture different memory patterns.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def evaluate(self, t: np.ndarray, s: np.ndarray) -> np.ndarray:
+        """
+        Evaluate kernel K(t,s) for given time points.
+
+        Args:
+            t: Current time points (n,)
+            s: Past time points (m,)
+
+        Returns:
+            Kernel matrix (n, m) where entry (i,j) is K(t[i], s[j])
+        """
+        raise NotImplementedError
+
+    def __call__(self, t: np.ndarray, s: np.ndarray) -> np.ndarray:
+        return self.evaluate(t, s)
+
+
+class PowerLawKernel(VolterraKernel):
+    """
+    Power-law kernel: K(t,s) = c * (t-s)^(alpha-1) / Gamma(alpha)
+
+    This kernel exhibits long-range temporal correlations and arises
+    naturally from fractional calculus.
+    """
+
+    def __init__(self, alpha: float = 0.5, c: float = 1.0):
+        super().__init__("power_law")
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+        if c <= 0:
+            raise ValueError(f"amplitude c must be positive, got {c}")
+        self.alpha = float(alpha)
+        self.c = float(c)
+        self.gamma_alpha = special.gamma(self.alpha)
+
+    def evaluate(self, t: np.ndarray, s: np.ndarray) -> np.ndarray:
+        """Evaluate K(t,s) = c * (t-s)^(alpha-1) / Gamma(alpha) for t > s."""
+        t_mat = t[:, np.newaxis]
+        s_mat = s[np.newaxis, :]
+        tau = t_mat - s_mat
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            kernel = np.where(
+                tau > 0,
+                self.c * np.power(tau, self.alpha - 1.0) / self.gamma_alpha,
+                0.0,
+            )
+        return np.nan_to_num(kernel, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def compute_weights(self, memory_length: int) -> np.ndarray:
+        """
+        Compute normalized weights for discrete gradient history.
+
+        Weights: w_i = (i+1)^(alpha-1) / sum_j (j)^(alpha-1)
+        Returned in descending order (most recent first).
+        """
+        if memory_length <= 0:
+            raise ValueError(f"memory_length must be positive, got {memory_length}")
+        indices = np.arange(1, memory_length + 1, dtype=np.float64)
+        raw_weights = np.power(indices, self.alpha - 1.0)
+        weights = raw_weights / np.sum(raw_weights)
+        return weights.copy()
+
+    def __repr__(self) -> str:
+        return f"PowerLawKernel(alpha={self.alpha:.3f}, c={self.c:.3f})"
+
+
+class ExponentialKernel(VolterraKernel):
+    """
+    Exponential decay kernel: K(t,s) = lambda * exp(-lambda * (t-s))
+    """
+
+    def __init__(self, lambda_: float = 1.0):
+        super().__init__("exponential")
+        if lambda_ <= 0:
+            raise ValueError(f"lambda must be positive, got {lambda_}")
+        self.lambda_ = float(lambda_)
+
+    def evaluate(self, t: np.ndarray, s: np.ndarray) -> np.ndarray:
+        t_mat = t[:, np.newaxis]
+        s_mat = s[np.newaxis, :]
+        tau = t_mat - s_mat
+        return np.where(
+            tau > 0,
+            self.lambda_ * np.exp(-self.lambda_ * tau),
+            0.0,
+        )
+
+    def compute_weights(self, memory_length: int) -> np.ndarray:
+        indices = np.arange(memory_length, dtype=np.float64)
+        weights = np.exp(-self.lambda_ * indices)
+        weights = weights / np.sum(weights)
+        return weights
+
+    def __repr__(self) -> str:
+        return f"ExponentialKernel(lambda={self.lambda_:.3f})"
+
+
+class UniformKernel(VolterraKernel):
+    """Uniform kernel: K(t,s) = 1 for t > s."""
+
+    def __init__(self):
+        super().__init__("uniform")
+
+    def evaluate(self, t: np.ndarray, s: np.ndarray) -> np.ndarray:
+        t_mat = t[:, np.newaxis]
+        s_mat = s[np.newaxis, :]
+        tau = t_mat - s_mat
+        return np.where(tau > 0, 1.0, 0.0)
+
+    def compute_weights(self, memory_length: int) -> np.ndarray:
+        return np.ones(memory_length, dtype=np.float64) / float(memory_length)
+
+    def __repr__(self) -> str:
+        return "UniformKernel()"
+
+
+def fit_volterra_kernel(
+    gradient_history: np.ndarray,
+    kernel_type: str = "power_law",
+    method: str = "L-BFGS-B",
+    verbose: bool = False,
+) -> Tuple[VolterraKernel, float, dict]:
+    """
+    Fit Volterra kernel parameters to observed gradient sequence.
+
+    Args:
+        gradient_history: Gradient sequence (T, D) where D is dimension
+        kernel_type: Type of kernel ('power_law', 'exponential', 'uniform')
+        method: Optimization method ('L-BFGS-B' or 'differential_evolution')
+        verbose: Print optimization progress
+
+    Returns:
+        (fitted_kernel, rmse, info)
+    """
+    grad = np.asarray(gradient_history, dtype=np.float64)
+    if grad.ndim == 1:
+        grad = grad[:, np.newaxis]
+    if grad.ndim != 2:
+        raise ValueError("gradient_history must be a 2D array (T, D).")
+    t_steps, _ = grad.shape
+    if t_steps < 10:
+        raise ValueError(f"Need at least 10 gradient samples, got {t_steps}")
+
+    kernel_type = str(kernel_type).lower()
+    if kernel_type in ("exp", "exponential"):
+        kernel_type = "exponential"
+    elif kernel_type in ("power", "powerlaw", "power_law", "power-law"):
+        kernel_type = "power_law"
+    elif kernel_type in ("uniform",):
+        kernel_type = "uniform"
+    else:
+        raise ValueError(f"Unknown kernel type: {kernel_type}")
+
+    times = np.arange(t_steps, dtype=np.float64)
+
+    def objective(params: np.ndarray) -> float:
+        if kernel_type == "power_law":
+            alpha, c = float(params[0]), float(params[1])
+            kernel = PowerLawKernel(alpha=alpha, c=c)
+        elif kernel_type == "exponential":
+            lambda_ = float(params[0])
+            kernel = ExponentialKernel(lambda_=lambda_)
+        elif kernel_type == "uniform":
+            kernel = UniformKernel()
+        else:
+            raise ValueError(f"Unknown kernel type: {kernel_type}")
+
+        k_mat = kernel.evaluate(times, times)
+        g_recon = k_mat @ grad
+        error = grad - g_recon
+        return float(np.sqrt((error ** 2).mean()))
+
+    if kernel_type == "power_law":
+        bounds = [(0.1, 0.99), (0.1, 10.0)]
+        x0 = np.array([0.5, 1.0], dtype=np.float64)
+    elif kernel_type == "exponential":
+        bounds = [(0.01, 10.0)]
+        x0 = np.array([1.0], dtype=np.float64)
+    else:
+        kernel = UniformKernel()
+        rmse = objective(np.array([], dtype=np.float64))
+        return kernel, rmse, {"success": True, "nit": 0, "message": "uniform"}
+
+    if method == "L-BFGS-B":
+        result = minimize(
+            objective,
+            x0=x0,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 100, "disp": verbose},
+        )
+        optimal_params = result.x
+        rmse = float(result.fun)
+        info = {
+            "success": bool(result.success),
+            "nit": int(result.nit),
+            "message": str(result.message),
+        }
+    elif method == "differential_evolution":
+        result = differential_evolution(
+            objective,
+            bounds=bounds,
+            maxiter=50,
+            disp=verbose,
+            seed=42,
+        )
+        optimal_params = result.x
+        rmse = float(result.fun)
+        info = {
+            "success": bool(result.success),
+            "nit": int(result.nit),
+            "message": str(result.message),
+        }
+    else:
+        raise ValueError(f"Unknown optimization method: {method}")
+
+    if kernel_type == "power_law":
+        alpha_opt, c_opt = float(optimal_params[0]), float(optimal_params[1])
+        fitted_kernel = PowerLawKernel(alpha=alpha_opt, c=c_opt)
+        if verbose:
+            print(f"[Volterra] Fitted alpha={alpha_opt:.4f}, c={c_opt:.4f}, RMSE={rmse:.6f}")
+            if alpha_opt < 0.7:
+                print("[Volterra] alpha < 0.7 -> RL-obfuscation suspected")
+            else:
+                print("[Volterra] alpha >= 0.7 -> Likely genuine gradients")
+    elif kernel_type == "exponential":
+        lambda_opt = float(optimal_params[0])
+        fitted_kernel = ExponentialKernel(lambda_=lambda_opt)
+        if verbose:
+            print(f"[Volterra] Fitted lambda={lambda_opt:.4f}, RMSE={rmse:.6f}")
+    else:
+        fitted_kernel = UniformKernel()
+
+    return fitted_kernel, rmse, info
+
+
+def compute_volterra_correlation(
+    gradient_history: np.ndarray,
+    max_lag: int = 50,
+) -> Tuple[np.ndarray, float]:
+    """
+    Compute temporal autocorrelation of gradient sequence.
+
+    Returns:
+        (autocorr, integral_timescale)
+    """
+    grad = np.asarray(gradient_history, dtype=np.float64)
+    if grad.ndim == 1:
+        grad = grad[:, np.newaxis]
+    if grad.ndim != 2:
+        raise ValueError("gradient_history must be a 2D array (T, D).")
+    t_steps, dims = grad.shape
+    if t_steps <= 1:
+        return np.zeros((0,), dtype=np.float64), 0.0
+
+    if max_lag >= t_steps:
+        max_lag = t_steps - 1
+
+    g_flat = grad - grad.mean(axis=0, keepdims=True)
+    autocorr = np.zeros(max_lag, dtype=np.float64)
+
+    for lag in range(max_lag):
+        if lag == 0:
+            autocorr[lag] = 1.0
+            continue
+        g_current = g_flat[lag:]
+        g_lagged = g_flat[:-lag]
+        if g_current.shape[0] < 2:
+            autocorr[lag] = 0.0
+            continue
+        dims_used = int(min(dims, 100))
+        corr_values = []
+        for d in range(dims_used):
+            a = g_current[:, d]
+            b = g_lagged[:, d]
+            if np.std(a) < 1e-12 or np.std(b) < 1e-12:
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                corr = np.corrcoef(a, b)[0, 1]
+            if np.isfinite(corr):
+                corr_values.append(float(corr))
+        autocorr[lag] = float(np.mean(corr_values)) if corr_values else 0.0
+
+    integral_timescale = float(np.trapz(autocorr, dx=1.0))
+    return autocorr, integral_timescale
 
 
 def _finite_1d(x: np.ndarray) -> np.ndarray:
@@ -228,8 +536,6 @@ def fit_volterra_power_law(
             return 1e9
         err = y - y_pred
         return float(np.sqrt(np.mean(err * err)))
-
-    from scipy.optimize import minimize
 
     res = minimize(
         _rmse_for,

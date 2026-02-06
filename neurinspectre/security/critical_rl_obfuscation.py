@@ -437,6 +437,8 @@ class CriticalRLObfuscationDetector:
 
         w = max(5, int(len(g) // 20))  # ~5% window, at least 5
         w = min(w, max(5, len(g) // 2))
+        if w % 2 == 0:
+            w += 1
         pad = w // 2
         kernel = np.ones(w, dtype=np.float64) / float(w)
         gp = np.pad(g, (pad, pad), mode='reflect')

@@ -9,6 +9,7 @@ transformers>=4.53.1
 accelerate>=0.29.0
 sentence-transformers>=2.2.0
 safetensors>=0.3.0
+onnxruntime
 
 # Scientific Computing
 numpy>=1.24.0,<2.0.0
@@ -26,6 +27,7 @@ llvmlite>=0.44.0
 pynndescent>=0.5
 sympy>=1.13.0
 networkx>=3.0.0
+h5py>=3.8.0
 
 # Security and Cryptography
 cryptography>=41.0.0
@@ -41,6 +43,10 @@ torchattacks>=3.4.0
 adversarial-robustness-toolbox>=1.15.0
 foolbox>=3.3.0
 robustbench>=1.0.0
+
+# Dataset tooling (real evaluations)
+ember>=0.1.0
+nuscenes-devkit>=1.1.10
 
 # Network Security and Analysis
 scapy>=2.5.0

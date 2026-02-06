@@ -51,6 +51,15 @@ class TemporalEvolutionAnalyzer:
         
         # Flatten gradients if needed
         flat_sequence = [g.reshape(-1) for g in gradient_sequence]
+        # Align sequence lengths to avoid broadcast errors when shapes differ.
+        lengths = [int(g.size) for g in flat_sequence if g is not None]
+        if lengths and len(set(lengths)) > 1:
+            min_len = min(lengths)
+            warnings.warn(
+                f"Temporal sequence has mixed lengths {sorted(set(lengths))}; "
+                f"truncating to min length {min_len}."
+            )
+            flat_sequence = [g[:min_len] for g in flat_sequence]
         
         # Compute temporal features
         temporal_metrics = self._compute_temporal_metrics(flat_sequence)

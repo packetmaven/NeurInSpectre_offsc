@@ -10,6 +10,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_CLICK_COMMANDS = {"attack", "characterize", "evaluate", "config"}
+
 class _NeurInSpectreArgumentParser(argparse.ArgumentParser):
     """ArgumentParser with friendlier diagnostics for common copy/paste errors."""
 
@@ -46,6 +48,11 @@ class _NeurInSpectreArgumentParser(argparse.ArgumentParser):
 
 def main():
     """Main CLI entry point"""
+    argv = sys.argv[1:]
+    if argv and argv[0] in _CLICK_COMMANDS:
+        from .main import main as click_main
+
+        return click_main()
     # Configure logging at runtime (avoid import-time side effects).
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
@@ -85,6 +92,7 @@ Examples:
   neurinspectre comprehensive-test full --output-report test_results.json
         """
     )
+    parser.add_argument('--version', action='version', version='neurinspectre 2.0.0')
     
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
@@ -788,8 +796,8 @@ Examples:
     pia.add_argument('--out-prefix', default='pia_')
     # Layer/head selection for attention visualization (per 2024 prompt injection research: 
     # Greshake et al., Perez & Ribeiro, Liu et al. - attention pattern analysis)
-    pia.add_argument('--layer', type=int, required=True, help='Transformer layer index for attention extraction (0-indexed)')
-    pia.add_argument('--head', type=int, required=True, help='Attention head index within the layer (0-indexed)')
+    pia.add_argument('--layer', type=int, default=0, help='Transformer layer index for attention extraction (0-indexed)')
+    pia.add_argument('--head', type=int, default=0, help='Attention head index within the layer (0-indexed)')
 
     # Occlusion (wrapper to occlusion-analysis)
     occ = subparsers.add_parser('occlusion', help='Occlusion analysis wrapper')
@@ -1840,6 +1848,33 @@ Examples:
                         dev = 'mps'
                     else:
                         dev = 'cpu'
+                elif dev == 'cuda' and not torch.cuda.is_available():
+                    logger.warning("CUDA requested but unavailable; falling back to CPU/MPS.")
+                    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        dev = 'mps'
+                    else:
+                        dev = 'cpu'
+                elif dev == 'mps' and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                    logger.warning("MPS requested but unavailable; falling back to CPU.")
+                    dev = 'cpu'
+                elif dev == 'cuda' and not torch.cuda.is_available():
+                    logger.warning("CUDA requested but unavailable; falling back to CPU/MPS.")
+                    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        dev = 'mps'
+                    else:
+                        dev = 'cpu'
+                elif dev == 'mps' and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                    logger.warning("MPS requested but unavailable; falling back to CPU.")
+                    dev = 'cpu'
+                elif dev == 'cuda' and not torch.cuda.is_available():
+                    logger.warning("CUDA requested but unavailable; falling back to CPU/MPS.")
+                    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        dev = 'mps'
+                    else:
+                        dev = 'cpu'
+                elif dev == 'mps' and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                    logger.warning("MPS requested but unavailable; falling back to CPU.")
+                    dev = 'cpu'
                 device = torch.device(str(dev))
 
                 # craft
@@ -3927,6 +3962,16 @@ Examples:
                 # Energy (mean power) for shares + entropy
                 pow_mean = np.mean(mags**2, axis=0)
                 pow_mean = np.asarray(pow_mean, dtype=np.float64)
+                # Defensive alignment: ensure all spectral arrays share the same length.
+                min_bins = int(min(mag_mean.size, mag_p10.size, mag_p90.size, pow_mean.size, freqs.size))
+                if min_bins <= 0:
+                    raise ValueError("Spectral analysis requires at least 1 frequency bin.")
+                if min_bins != mag_mean.size or min_bins != freqs.size:
+                    mag_mean = mag_mean[:min_bins]
+                    mag_p10 = mag_p10[:min_bins]
+                    mag_p90 = mag_p90[:min_bins]
+                    pow_mean = pow_mean[:min_bins]
+                    freqs = freqs[:min_bins]
 
                 # Baseline comparison (recommended)
                 baseline_path = getattr(args, "baseline", None)
@@ -3988,10 +4033,16 @@ Examples:
                 else:
                     # Smooth magnitude curve (moving average) to estimate background
                     win = int(max(7, min(61, (mag_mean.size // 25) * 2 + 1)))  # odd-ish window
-                    kernel = np.ones(win, dtype=np.float64) / float(win)
-                    smooth = np.convolve(mag_mean, kernel, mode="same")
-                    prom = (mag_mean + 1e-12) / (smooth + 1e-12)
-                    prom_db = 20.0 * np.log10(prom)
+                    win = min(win, int(mag_mean.size))
+                    if win < 3:
+                        prom_db = np.zeros_like(mag_mean, dtype=np.float64)
+                    else:
+                        if win % 2 == 0:
+                            win = max(3, win - 1)
+                        kernel = np.ones(win, dtype=np.float64) / float(win)
+                        smooth = np.convolve(mag_mean, kernel, mode="same")
+                        prom = (mag_mean + 1e-12) / (smooth + 1e-12)
+                        prom_db = 20.0 * np.log10(prom)
                     metric = prom_db.copy()
                     metric[~np.isfinite(metric)] = -1e9
                     metric = metric[valid]
@@ -4331,9 +4382,15 @@ Examples:
                     else:
                         if prom_db is None:
                             win = int(max(7, min(61, (mag_mean.size // 25) * 2 + 1)))
-                            kernel = np.ones(win, dtype=np.float64) / float(win)
-                            smooth = np.convolve(mag_mean, kernel, mode="same")
-                            prom_db = 20.0 * np.log10((mag_mean + 1e-12) / (smooth + 1e-12))
+                            win = min(win, int(mag_mean.size))
+                            if win < 3:
+                                prom_db = np.zeros_like(mag_mean, dtype=np.float64)
+                            else:
+                                if win % 2 == 0:
+                                    win = max(3, win - 1)
+                                kernel = np.ones(win, dtype=np.float64) / float(win)
+                                smooth = np.convolve(mag_mean, kernel, mode="same")
+                                prom_db = 20.0 * np.log10((mag_mean + 1e-12) / (smooth + 1e-12))
                         y2 = prom_db
                         y2_name = "Local prominence (dB)"
 
@@ -5683,6 +5740,12 @@ Examples:
                     baseline = {}
                     for layer in base_dicts[0].keys():
                         tensors = [d[layer] for d in base_dicts]
+                        # Align sequence length before concatenation (avoid shape mismatch across prompts).
+                        seq_lens = [int(t.shape[1]) for t in tensors if getattr(t, "dim", lambda: 0)() >= 3]
+                        if seq_lens:
+                            min_len = min(seq_lens)
+                            if any(int(t.shape[1]) != min_len for t in tensors):
+                                tensors = [t[:, :min_len, :] for t in tensors]
                         # concatenate on batch dimension (each prompt contributes one batch)
                         baseline[layer] = torch.cat(tensors, dim=0)
                 else:
@@ -7167,6 +7230,15 @@ Examples:
                         dev = 'mps'
                     else:
                         dev = 'cpu'
+                elif dev == 'cuda' and not torch.cuda.is_available():
+                    logger.warning("CUDA requested but unavailable; falling back to CPU/MPS.")
+                    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        dev = 'mps'
+                    else:
+                        dev = 'cpu'
+                elif dev == 'mps' and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                    logger.warning("MPS requested but unavailable; falling back to CPU.")
+                    dev = 'cpu'
 
                 logger.info(f"🔥 Layer-Level Causal Impact Analysis")
                 logger.info(f"   Model: {args.model}")
@@ -7184,11 +7256,16 @@ Examples:
                 model.eval()
 
                 # Run analysis
+                baseline_prompt = str(getattr(args, 'baseline_prompt', '') or '').strip()
+                test_prompt = str(getattr(args, 'test_prompt', '') or '').strip()
+                if not baseline_prompt or not test_prompt:
+                    raise ValueError("baseline_prompt and test_prompt must be non-empty strings")
+
                 impact_scores, hot_layers = analyze_layer_causal_impact(
                     model=model,
                     tokenizer=tokenizer,
-                    baseline_prompt=args.baseline_prompt,
-                    test_prompt=args.test_prompt,
+                    baseline_prompt=baseline_prompt,
+                    test_prompt=test_prompt,
                     device=dev,
                     method=args.method,
                     percentile=args.percentile,
@@ -7216,10 +7293,10 @@ Examples:
                 metadata = {
                     'model': args.model,
                     'tokenizer': tok_id,
-                    'baseline_prompt': args.baseline_prompt,
-                    'test_prompt': args.test_prompt,
-                    'baseline_prompt_sha16': hashlib.sha256(args.baseline_prompt.encode('utf-8')).hexdigest()[:16],
-                    'test_prompt_sha16': hashlib.sha256(args.test_prompt.encode('utf-8')).hexdigest()[:16],
+                    'baseline_prompt': baseline_prompt,
+                    'test_prompt': test_prompt,
+                    'baseline_prompt_sha16': hashlib.sha256(baseline_prompt.encode('utf-8')).hexdigest()[:16],
+                    'test_prompt_sha16': hashlib.sha256(test_prompt.encode('utf-8')).hexdigest()[:16],
                     'method': args.method,
                     'percentile': float(args.percentile),
                     'layer_start': args.layer_start,

@@ -8,8 +8,8 @@ import sys
 
 def main():
     """Main entry point for neurinspectre package"""
-    # Delegate to CLI main
-    from neurinspectre.cli.__main__ import main as cli_main
+    # Delegate to Click-based CLI (with legacy fallback)
+    from neurinspectre.cli.main import main as cli_main
     return cli_main()
 
 if __name__ == '__main__':

@@ -356,11 +356,11 @@ def run_nvidia_specific(args) -> int:
         try:
             res = subprocess.run(["nvidia-smi", "--version"], capture_output=True, text=True, timeout=5, check=False)
             if res.returncode != 0:
-                print("❌ nvidia-smi not available on this system")
-                return 1
+                print("⚠️  nvidia-smi not available on this system (skipping NVIDIA checks)")
+                return 0
         except Exception:
-            print("❌ nvidia-smi not available on this system")
-            return 1
+            print("⚠️  nvidia-smi not available on this system (skipping NVIDIA checks)")
+            return 0
 
         from ..universal_gpu_detector import UniversalGPUDetector
 

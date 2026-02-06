@@ -98,7 +98,17 @@ def run_occlusion_analysis(
 
     width, height = image.size
     if patch_size > width or patch_size > height:
-        raise ValueError(f"patch_size={patch_size} exceeds image dimensions {(width, height)}")
+        # Auto-resize tiny images to keep occlusion analysis usable.
+        new_w = max(width, patch_size)
+        new_h = max(height, patch_size)
+        logger.warning(
+            "patch_size=%s exceeds image dimensions %s; resizing image to %s.",
+            patch_size,
+            (width, height),
+            (new_w, new_h),
+        )
+        image = image.resize((new_w, new_h))
+        width, height = image.size
 
     # Convert image to tensor
     inputs = processor(images=image, return_tensors="pt")

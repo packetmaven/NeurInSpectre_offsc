@@ -87,8 +87,12 @@ def run_ednn(args):
     tokenizer = None
     if needs_model:
         if not getattr(args, "model", None):
-            print("❌ Missing --model (required for inversion/steganographic/rag_poison).")
-            return 1
+            default_model = "sentence-transformers/all-MiniLM-L6-v2"
+            print(
+                "⚠️  Missing --model (required for inversion/steganographic/rag_poison). "
+                f"Defaulting to {default_model}."
+            )
+            args.model = default_model
         model, tokenizer = load_embedding_model(args.model, device=config.device)
         if model is None or tokenizer is None:
             print(f"❌ Failed to load embedding model/tokenizer: {args.model}")

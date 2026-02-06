@@ -13,7 +13,7 @@ long_description = (this_directory / "README.md").read_text(encoding='utf-8')
 
 setup(
     name="neurinspectre",
-    version="1.0.0",
+    version="2.0.0",
     author="packetmaven",
     description="AI Security Interpretability Platform with cutting-edge threat detection",
     long_description=long_description,
@@ -38,6 +38,7 @@ setup(
         "torch>=2.3.1",
         "torchvision>=0.18.1",
         "torchaudio>=2.3.1",
+        "onnxruntime",
         "numpy>=1.24.0,<2.0.0",
         "scipy>=1.10.0",
         "scikit-learn>=1.3.0,<1.4.0",
@@ -46,9 +47,11 @@ setup(
         "seaborn>=0.12.0",
         "plotly>=5.15.0",
         "dash>=2.14.1",
-        "click>=8.0.0",
+        "click>=8.1.0",
+        "rich>=13.7.0",
+        "rich-click>=1.8.0",
         "tqdm>=4.65.0",
-        "pyyaml>=6.0.0",
+        "pyyaml>=6.0",
         "transformers>=4.53.1",
         "accelerate>=0.29.0",
         "cryptography>=41.0.0",
@@ -81,7 +84,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "neurinspectre=neurinspectre.cli.__main__:main",
+            "neurinspectre=neurinspectre.cli.main:main",
             "neurinspectre-obfgrad=neurinspectre.security.visualization.obfuscated_gradient_visualizer:main",
         ],
     },

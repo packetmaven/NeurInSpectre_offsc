@@ -1686,8 +1686,11 @@ def handle_evasion_detect(args):
     try:
         if args.detector_type == 'demarking':
             if network_flow_data is None:
-                raise ValueError("detector-type=demarking requires --network-data (.pcap/.npy IPD series)")
-            ipd = np.asarray(network_flow_data).reshape(-1)
+                print("⚠️  detector-type=demarking expects --network-data; using neural data as IPD fallback.")
+                ipd = np.asarray(neural_data).reshape(-1)
+                network_flow_data = ipd
+            else:
+                ipd = np.asarray(network_flow_data).reshape(-1)
             dem = detector.demarking_detector.detect_watermarking_evasion(ipd)
             analysis_details["demarking"] = dem
             analysis_details["demarking_ipd_len"] = int(ipd.size)

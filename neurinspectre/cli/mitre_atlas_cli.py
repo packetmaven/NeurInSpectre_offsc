@@ -48,10 +48,10 @@ def register_mitre_atlas(subparsers) -> None:
     lp_sub = lp.add_subparsers(dest='list_kind', required=True)
 
     lpt = lp_sub.add_parser('tactics', help='List all tactics (16)')
-    lpt.add_argument('--format', choices=['table', 'json', 'markdown'], default='table')
+    lpt.add_argument('--format', choices=['table', 'text', 'json', 'markdown'], default='table')
 
     lpx = lp_sub.add_parser('techniques', help='List all techniques (140; includes sub-techniques)')
-    lpx.add_argument('--format', choices=['table', 'json', 'markdown'], default='table')
+    lpx.add_argument('--format', choices=['table', 'text', 'json', 'markdown'], default='table')
     lpx.add_argument(
         '--tactic',
         default=None,
@@ -120,7 +120,7 @@ def run_mitre_atlas(args) -> int:
                     print(f"- {t.tactic_id} {t.name}")
                 return 0
 
-            # table
+            # table/text
             print('tactic_id	name	phase_name')
             for t in tactics:
                 print(f"{t.tactic_id}	{t.name}	{t.phase_name}")
@@ -168,7 +168,7 @@ def run_mitre_atlas(args) -> int:
                     print(f"- {t.technique_id} {t.name}")
                 return 0
 
-            # table
+            # table/text
             phase_to_tactic = tactic_by_phase_name(bundle)
             print('technique_id	name	tactics')
             for t in techs:
