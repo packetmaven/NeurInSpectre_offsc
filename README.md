@@ -1834,7 +1834,13 @@ Where:
 
 **Linear Operator (Discrete Laplacian):**
 
-$$L = \begin{pmatrix} -2 & 1 & 0 & \cdots \\ 1 & -2 & 1 & \cdots \\ \vdots & \ddots & \ddots & \ddots \end{pmatrix}$$
+$$
+L = \begin{pmatrix}
+-2 & 1 & 0 & \cdots \\
+1 & -2 & 1 & \cdots \\
+\vdots & \ddots & \ddots & \ddots
+\end{pmatrix}
+$$
 
 #### 3.2 Exponential Time Differencing (ETD2 Scheme)
 
