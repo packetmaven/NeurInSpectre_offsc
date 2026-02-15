@@ -92,15 +92,37 @@ class EOT(Attack):
             losses.append(loss.item())
             grads.append(g)
 
-        losses_tensor = torch.tensor([-l for l in losses], device=self.device)
-        weights = F.softmax(losses_tensor / self.temperature, dim=0)
+        weights = self._compute_importance_weights(losses, temperature=self.temperature, device=self.device)
 
         grad_weighted = torch.zeros_like(delta)
         for w, g in zip(weights, grads):
             grad_weighted += w.item() * g
 
-        effective_n = 1.0 / (weights**2).sum().item()
-        return grad_weighted, effective_n
+        # Diagnostic only: "effective sample size" under importance weighting.
+        # The returned gradient is already an importance-weighted *mean* since weights sum to 1.
+        self._last_effective_n = float(1.0 / max((weights**2).sum().item(), 1e-12))
+        return grad_weighted, 1
+
+    @staticmethod
+    def _compute_importance_weights(
+        losses: list[float],
+        *,
+        temperature: float,
+        device: str,
+    ) -> torch.Tensor:
+        """
+        Convert per-sample EOT losses into importance weights.
+
+        Higher-loss transforms receive larger weight, emphasizing adversarially
+        difficult stochastic outcomes.
+        """
+        if len(losses) == 0:
+            return torch.zeros((0,), device=device)
+        temp = max(float(temperature), 1e-8)
+        losses_tensor = torch.as_tensor(losses, dtype=torch.float32, device=device)
+        scaled = losses_tensor / temp
+        scaled = scaled - scaled.max()  # numerical stability
+        return F.softmax(scaled, dim=0)
 
 
 class AdaptiveEOT(Attack):

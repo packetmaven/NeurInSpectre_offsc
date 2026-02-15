@@ -1,0 +1,6 @@
+{
+  "is_stub": true,
+  "dataset": "cifar10",
+  "reason": "Placeholder artifact (untrained / not for strict real-data evaluation)."
+}
+

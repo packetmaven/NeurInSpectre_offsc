@@ -5,6 +5,27 @@ from __future__ import annotations
 import torch
 
 
+_GRAD_SANITY_WARN_COUNTS: dict[str, int] = {}
+_GRAD_SANITY_MAX_WARNINGS_PER_KEY = 3
+
+
+def _warn_throttled(key: str, message: str) -> None:
+    """
+    Print at most N warnings per logical attack key.
+
+    Many call sites include per-step suffixes (e.g. "PGD-step17"), which can
+    otherwise spam stdout and drown out the CLI report.
+    """
+    count = _GRAD_SANITY_WARN_COUNTS.get(key, 0)
+    if count < _GRAD_SANITY_MAX_WARNINGS_PER_KEY:
+        _GRAD_SANITY_WARN_COUNTS[key] = count + 1
+        print(message)
+        return
+    if count == _GRAD_SANITY_MAX_WARNINGS_PER_KEY:
+        _GRAD_SANITY_WARN_COUNTS[key] = count + 1
+        print(f"[WARN] Further gradient warnings suppressed for {key}")
+
+
 def infer_data_range(x: torch.Tensor) -> tuple[float, float]:
     """
     Infer min/max of data once for clamping across attack steps.
@@ -58,17 +79,22 @@ def check_grad_sanity(grad: torch.Tensor | None, name: str = "") -> bool:
         grad: Gradient tensor
         name: Debug identifier (e.g., "PGD", "APGD")
     """
+    warn_key = str(name or "grad")
+    # Collapse per-step names ("PGD-step12" -> "PGD") to avoid spamming output.
+    step_idx = warn_key.find("-step")
+    if step_idx != -1:
+        warn_key = warn_key[:step_idx]
     if grad is None:
         tag = f" in {name}" if name else ""
-        print(f"[WARN] Gradient is None{tag}")
+        _warn_throttled(warn_key, f"[WARN] Gradient is None{tag}")
         return False
     if torch.isnan(grad).any():
         tag = f" in {name}" if name else ""
-        print(f"[WARN] NaN detected in gradient{tag}")
+        _warn_throttled(warn_key, f"[WARN] NaN detected in gradient{tag}")
         return False
     if torch.isinf(grad).any():
         tag = f" in {name}" if name else ""
-        print(f"[WARN] Inf detected in gradient{tag}")
+        _warn_throttled(warn_key, f"[WARN] Inf detected in gradient{tag}")
         return False
     return True
 

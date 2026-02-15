@@ -238,7 +238,7 @@ def register_attack_commands(subparsers) -> None:
     pc = subparsers.add_parser(
         "reproduce-claims",
         aliases=["paper-claims", "paper-claim-validation"],
-        help="🔴 Reproduce paper claims (Figure 1 / Tables 2-8)",
+        help="[DISABLED] Legacy paper-claim validation (use Click CLI evaluate/table2)",
     )
     pc.add_argument(
         "--claim",
@@ -253,7 +253,7 @@ def register_attack_commands(subparsers) -> None:
         "--mode",
         choices=["fast", "strict"],
         default="fast",
-        help="fast uses synthetic/short runs; strict uses full evaluation",
+        help="Deprecated (command is disabled)",
     )
     pc.add_argument("--no-plot", action="store_true", help="Disable figure plotting")
     pc.add_argument("--output", default=None, help="Optional JSON output path")
@@ -263,7 +263,7 @@ def register_attack_commands(subparsers) -> None:
     rt1 = subparsers.add_parser(
         "reproduce-table1",
         aliases=["table1", "reproduce-table-1"],
-        help="🔴 Reproduce Table 1 (real datasets/models)",
+        help="[DISABLED] Legacy table runner (use Click CLI evaluate/table2)",
     )
     rt1.add_argument(
         "--config",
@@ -281,7 +281,7 @@ def register_attack_commands(subparsers) -> None:
     ra = subparsers.add_parser(
         "reproduce-all",
         aliases=["reproduce-all-tables", "reproduce-suite"],
-        help="🔴 Reproduce Table 1 + all claim validations",
+        help="[DISABLED] Legacy reproduction suite (use Click CLI evaluate/table2)",
     )
     ra.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu", help="Device")
     ra.add_argument("--n-seeds", type=int, default=2, help="Random seeds (default: 2)")
@@ -295,7 +295,7 @@ def register_attack_commands(subparsers) -> None:
         "--mode",
         choices=["fast", "strict"],
         default="fast",
-        help="fast uses synthetic/short runs; strict uses full evaluation",
+        help="Deprecated (command is disabled)",
     )
     ra.add_argument("--results-dir", default="_cli_runs/comprehensive_results", help="Results directory")
     ra.add_argument("--no-plot", action="store_true", help="Disable plot generation")
@@ -753,101 +753,45 @@ def _handle_attack_orchestrate(args) -> int:
 
 
 def _handle_reproduce_claims(args) -> int:
-    from neurinspectre.experiments.reproduce_paper_claims import PaperClaimValidator
+    import sys
 
-    fast_mode = args.mode == "fast"
-    synthetic_mode = args.mode == "fast"
-
-    validator = PaperClaimValidator(
-        device=args.device,
-        n_seeds=int(args.n_seeds),
-        results_dir=str(args.results_dir),
-        verbose=True,
-        fast_mode=fast_mode,
-        synthetic_mode=synthetic_mode,
-        plot=not args.no_plot,
+    print(
+        "[ERROR] Paper-claim reproduction helpers are intentionally not shipped in-repo.\n"
+        "Use the Click CLI evaluation pipeline instead:\n"
+        "  - neurinspectre evaluate --config <path>\n"
+        "  - neurinspectre table2 --config <path> --strict-real-data\n"
+        "If you want baseline validation, pass expected values via an external file "
+        "(e.g., neurinspectre compare --mode baseline --expected-asr-path <path>).",
+        file=sys.stderr,
     )
-
-    claim = args.claim
-    if claim == "all":
-        results = validator.validate_all()
-        payload = {
-            "claim": "all",
-            "results": results,
-        }
-    else:
-        claim_map = {
-            "figure_1": ("figure_1_correlation", validator.validate_figure_1_alpha_correlation),
-            "table_2": ("table_2_ablation", validator.validate_table_2_ablation),
-            "table_3": ("table_3_mapgd_improvement", validator.validate_table_3_mapgd),
-            "table_5": ("table_5_alpha_sensitivity", validator.validate_table_5_alpha_sensitivity),
-            "table_8": ("table_8_characterization", validator.validate_table_8_characterization),
-        }
-        key, fn = claim_map[claim]
-        passed = fn()
-        payload = {"claim": key, "passed": passed}
-
-    if validator.results:
-        payload["metrics"] = {
-            name: {
-                "value": res.value,
-                "std": res.std,
-                "ci_lower": res.ci_lower,
-                "ci_upper": res.ci_upper,
-                "n_samples": res.n_samples,
-                "p_value": res.p_value,
-            }
-            for name, res in validator.results.items()
-        }
-
-    _emit_result(payload, args.output)
-    return 0
+    return 2
 
 
 def _handle_reproduce_table1(args) -> int:
-    from neurinspectre.experiments.reproduce_table1 import Table1Reproducer
-    from pathlib import Path
+    import sys
 
-    reproducer = Table1Reproducer(
-        config_path=args.config,
-        device=args.device,
-        results_dir=str(args.results_dir),
-        allow_missing=bool(args.allow_missing),
+    print(
+        "[ERROR] Legacy table reproduction commands are disabled.\n"
+        "Use the Click CLI evaluation pipeline:\n"
+        "  neurinspectre evaluate --config <path> --results-dir <dir> --output <json>\n"
+        "or run the Table 2 matrix runner:\n"
+        "  neurinspectre table2 --config <path> --strict-real-data",
+        file=sys.stderr,
     )
-    results = reproducer.run_evaluation()
-    reproducer.print_table()
-    reproducer.save_results(str(Path(args.results_dir) / "table1_results.csv"))
-    if not args.no_plot:
-        reproducer.plot_results(str(Path(args.results_dir) / "table1_results.png"))
-
-    payload = {
-        "config": args.config,
-        "results": [r.to_dict() for r in results],
-    }
-    _emit_result(payload, args.output)
-    return 0
+    return 2
 
 
 def _handle_reproduce_all_tables(args) -> int:
-    from neurinspectre.experiments.reproduce_all_tables import ComprehensiveReproduction
+    import sys
 
-    fast_mode = args.mode == "fast"
-    synthetic_mode = args.mode == "fast"
-    reproduction = ComprehensiveReproduction(
-        device=args.device,
-        n_seeds=int(args.n_seeds),
-        table1_config=args.table1_config,
-        allow_missing=bool(args.allow_missing),
-        results_dir=str(args.results_dir),
-        fast_mode=fast_mode,
-        synthetic_mode=synthetic_mode,
-        plot=not args.no_plot,
-        verbose=True,
+    print(
+        "[ERROR] Legacy 'reproduce-all' is disabled.\n"
+        "Use the Click CLI commands:\n"
+        "  - neurinspectre evaluate --config <path>\n"
+        "  - neurinspectre table2 --config <path> --strict-real-data",
+        file=sys.stderr,
     )
-    results = reproduction.reproduce_everything()
-    reproduction.generate_report()
-    _emit_result(results, args.output)
-    return 0
+    return 2
 
 
 def _handle_testing_context(args) -> int:

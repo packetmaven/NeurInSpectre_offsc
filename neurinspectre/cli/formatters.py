@@ -12,6 +12,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from ..evaluation.budgets import get_attack_budgets
+
 
 def build_console(no_color: bool = False, force_color: bool = False) -> Console:
     if no_color:
@@ -392,9 +394,26 @@ def render_evaluation_report(
     brief: bool = False,
     summary_only: bool = False,
 ) -> None:
-    threat = config.get("perturbation", {})
-    epsilon = threat.get("epsilon", 8 / 255)
-    norm = threat.get("norm", "Linf")
+    # Prefer per-dataset budgets when available (Table2-style multi-dataset runs).
+    threat_value = None
+    budgets = get_attack_budgets(config)
+    datasets_seen = sorted({str(r.get("dataset")) for r in results if r.get("dataset")})
+    if budgets and datasets_seen:
+        parts = []
+        for dataset_name in datasets_seen:
+            budget = dict(budgets.get(dataset_name, {}) or {})
+            eps = budget.get("epsilon", budget.get("eps"))
+            norm = budget.get("norm")
+            if eps is None and norm is None:
+                continue
+            parts.append(f"{dataset_name} {norm} eps={_format_float(eps)}")
+        if parts:
+            threat_value = "; ".join(parts)
+    if not threat_value:
+        threat = config.get("perturbation", {})
+        epsilon = threat.get("epsilon", 8 / 255)
+        norm = threat.get("norm", "Linf")
+        threat_value = f"{norm} eps={_format_float(epsilon)}"
     attack_names: Iterable[str] = []
     if results:
         attack_names = (results[0].get("attacks", {}) or {}).keys()
@@ -420,7 +439,7 @@ def render_evaluation_report(
 
     severity = _risk_level(overall_worst)
     summary_rows = [
-        ("Threat", f"{norm} eps={_format_float(epsilon)}"),
+        ("Threat", str(threat_value)),
         ("Defenses", str(len(results))),
         ("Attacks", str(len(attack_names))),
         ("Worst ASR", _format_pct(overall_worst)),

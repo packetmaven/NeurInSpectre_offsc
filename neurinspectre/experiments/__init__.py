@@ -1,16 +1,9 @@
-"""Experiment utilities for reproducing paper claims."""
+"""
+Legacy experiment helpers.
 
-from .reproduce_paper_claims import PaperClaimValidator, reproduce_all_paper_claims
-from ..evaluation.table1_reproducer import DefenseResult
-from .reproduce_table1 import Table1Reproducer, reproduce_table1
-from .reproduce_all_tables import ComprehensiveReproduction, reproduce_all_tables
+This repo intentionally does not ship paper baseline numbers or paper-table
+reproduction scripts. Use the Click CLI (`neurinspectre evaluate`, `neurinspectre table2`)
+and supply any expected/baseline values via external files when validating results.
+"""
 
-__all__ = [
-    "PaperClaimValidator",
-    "reproduce_all_paper_claims",
-    "DefenseResult",
-    "Table1Reproducer",
-    "reproduce_table1",
-    "ComprehensiveReproduction",
-    "reproduce_all_tables",
-]
+__all__: list[str] = []

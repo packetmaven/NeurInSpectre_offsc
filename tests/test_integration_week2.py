@@ -3,16 +3,12 @@ Integration tests for Week 2 implementations.
 
 Tests end-to-end workflows:
   1. Characterization -> Orchestration -> Attack
-  2. Figure 1 reproduction (alpha vs delta ASR)
-  3. All paper claim validations (fast/synthetic mode)
 """
 
 import torch
-import pytest
 
 from neurinspectre.characterization import DefenseAnalyzer
 from neurinspectre.attacks import AttackOrchestrator
-from neurinspectre.experiments.reproduce_paper_claims import PaperClaimValidator, reproduce_all_paper_claims
 
 
 def test_end_to_end_pipeline():
@@ -40,29 +36,6 @@ def test_end_to_end_pipeline():
         asr = (preds != y).float().mean()
 
     assert asr >= 0.0
-
-
-@pytest.mark.slow
-def test_reproduce_figure_1():
-    """Test Figure 1 reproduction (alpha vs delta ASR correlation)."""
-    validator = PaperClaimValidator(
-        device="cpu",
-        n_seeds=2,
-        verbose=True,
-        fast_mode=True,
-        synthetic_mode=True,
-        plot=False,
-    )
-    passed = validator.validate_figure_1_alpha_correlation()
-    assert passed
-
-
-@pytest.mark.slow
-def test_reproduce_all_claims():
-    """Test all paper claim reproductions."""
-    results = reproduce_all_paper_claims(device="cpu", n_seeds=2, fast_mode=True, synthetic_mode=True, plot=False)
-    pass_rate = sum(results.values()) / len(results)
-    assert pass_rate >= 0.6
 
 
 def create_dummy_loader(n_batches=3, batch_size=20):

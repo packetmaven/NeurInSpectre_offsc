@@ -59,10 +59,10 @@ DEFAULT_EPSILON = 8 / 255
 # Paper Section 4: "EOT sampling... typically N in [10,100]"
 DEFAULT_EOT_SAMPLES = 50
 
-# Paper Section 4: "Importance weighting reduces variance by 40%"
+# Paper Section 4: importance weighting reduces variance (vs uniform sampling).
 EOT_IMPORTANCE_WEIGHTING_DEFAULT = True
 
-# Paper Section 5.3: "N<10 reduces ASR by 8% on stochastic defenses"
+# Paper Section 5.3: warns about too-small EOT sample counts on stochastic defenses.
 MIN_EOT_SAMPLES_WARNING = 10
 
 # Paper Section 3.2.3: "kappa is a confidence margin (typically 0)"
@@ -96,8 +96,7 @@ def _select_loss_function(
     obf_lower = [t.lower() for t in obf_types]
 
     # Paper Algorithm 2 line 8: if VANISHING then L = L_logit
-    # Paper Section 5.4.1: "The synthesized attack uses logit-based loss L_logit,
-    #   bypassing the softmax saturation. This achieves 94.6% ASR."
+    # Paper Section 5.4.1: use logit-based loss to bypass softmax saturation.
     if "vanishing" in obf_lower or "distillation" in obf_lower:
         logger.info(
             "Vanishing/distillation gradients detected -> switching to logit-margin loss "
@@ -133,12 +132,11 @@ def _configure_eot(
 
     Paper Section 4:
         "We adaptively select the number of EOT samples N based on estimated
-         gradient variance, typically N in [10,100]. Importance weighting reduces
-         variance by 40% compared to uniform sampling."
+         gradient variance. Importance weighting reduces estimator variance
+         compared to uniform sampling."
 
     Paper Section 5.3:
-        "EOT sample count N has larger impact: N<10 reduces ASR by 8% on
-         stochastic defenses."
+        Warns that very small N can materially reduce ASR on stochastic defenses.
 
     Paper Section 5.4.2 Case Study - Randomized Smoothing:
         "Our characterization detects stochasticity (sigma^2_g > 0.1) and applies
@@ -177,7 +175,7 @@ def _configure_eot(
     if n_eot < MIN_EOT_SAMPLES_WARNING:
         logger.warning(
             "EOT sample count N=%d is below recommended minimum (%d). "
-            "Paper Section 5.3: N<10 reduces ASR by 8%% on stochastic defenses.",
+            "Paper Section 5.3: very small N can materially reduce ASR on stochastic defenses.",
             n_eot,
             MIN_EOT_SAMPLES_WARNING,
         )
@@ -185,7 +183,7 @@ def _configure_eot(
     attack_config["n_eot_samples"] = n_eot
 
     # Paper Eq 14: importance weights w_i proportional to L(f(g_i(x)), y)
-    # Paper Section 4: "Importance weighting reduces variance by 40%"
+    # Paper Section 4: importance weighting reduces estimator variance.
     attack_config["eot_importance_weighting"] = EOT_IMPORTANCE_WEIGHTING_DEFAULT
 
     logger.info(
@@ -224,9 +222,8 @@ def _configure_bpda(
          networks (~100K parameters) to approximate the transformation."
 
     Paper Section 5.4.3 Case Study - Thermometer Encoding:
-        "We train a differentiable approximation network g' to model the
-         thermometer transformation. Using BPDA through this approximation,
-         NEURINSPECTRE achieves 96.1% ASR."
+        Trains a differentiable approximation network g' to model the
+        thermometer transformation, then uses BPDA through g'.
 
     Cross-ref: Paper Equation 5  (BPDA gradient computation)
     Cross-ref: Paper Equation 13 (learned approximation objective)
@@ -267,7 +264,7 @@ def _configure_bpda(
         logger.info(
             "Shattered gradients (%s) -> BPDA with LEARNED approximation "
             "(Paper Section 4: ~100K params, Eq 13 Jacobian regularization). "
-            "Case Study: Section 5.4.3 Thermometer Encoding -> 96.1%% ASR.",
+            "Case Study: Section 5.4.3 Thermometer Encoding.",
             defense_name,
         )
     elif defense_key in identity_defenses or "shattered" in obf_lower:
@@ -394,8 +391,14 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
 
     dataset_name = kwargs.get("dataset")
     data_path = kwargs.get("data_path")
+    labels_path = kwargs.get("labels_path")
+    nuscenes_version = kwargs.get("nuscenes_version")
     if dataset_name == "custom" and not data_path:
         raise click.ClickException("Custom dataset requires --data-path.")
+    if dataset_name == "nuscenes" and not labels_path:
+        raise click.ClickException(
+            "nuScenes dataset requires --labels-path mapping sample_token -> class label."
+        )
 
     batch_size = int(kwargs.get("batch_size", 128))
     num_samples = int(kwargs.get("num_samples", 1000))
@@ -406,6 +409,8 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
     loader, _x, _y = load_dataset(
         dataset_name,
         data_path=data_path,
+        labels_path=labels_path,
+        nuscenes_version=nuscenes_version,
         num_samples=num_samples,
         batch_size=batch_size,
         seed=seed,

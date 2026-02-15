@@ -65,12 +65,6 @@ DEFAULT_NUM_CHARACTERIZATION_SAMPLES = 100
 # Paper Table 1 caption: "epsilon=8/255 for Linf attacks"
 DEFAULT_EPSILON = 8 / 255
 
-# Paper Section 5.2.1: "correctly identified obfuscation type for 11 of 12 (91.7%)"
-CHARACTERIZATION_ACCURACY_BENCHMARK = 0.917
-
-# Paper Section 5.3: Ablation shows "Spectral analysis" provides 7.1pp improvement
-SPECTRAL_ANALYSIS_CONTRIBUTION = 0.071
-
 
 def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
     """
@@ -109,8 +103,14 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
 
     dataset_name = kwargs.get("dataset")
     data_path = kwargs.get("data_path")
+    labels_path = kwargs.get("labels_path")
+    nuscenes_version = kwargs.get("nuscenes_version")
     if dataset_name == "custom" and not data_path:
         raise click.ClickException("Custom dataset requires --data-path.")
+    if dataset_name == "nuscenes" and not labels_path:
+        raise click.ClickException(
+            "nuScenes dataset requires --labels-path mapping sample_token -> class label."
+        )
 
     num_samples = int(kwargs.get("num_samples", DEFAULT_NUM_CHARACTERIZATION_SAMPLES))
     batch_size = int(kwargs.get("batch_size", 128))
@@ -121,6 +121,8 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
     loader, _x, _y = load_dataset(
         dataset_name,
         data_path=data_path,
+        labels_path=labels_path,
+        nuscenes_version=nuscenes_version,
         num_samples=num_samples,
         batch_size=batch_size,
         seed=seed,
@@ -170,7 +172,7 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
     if krylov_order < 10 or krylov_order > 50:
         logger.warning(
             "Krylov order k=%d is outside recommended range [10, 50]. "
-            "Paper Section 5.3: k in [10,50] changes ASR by <2%%.",
+            "Paper Section 5.3: use k in [10,50] for stable results.",
             krylov_order,
         )
 
@@ -336,15 +338,15 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
     # -------------------------------------------------------------------
     # 10. Log characterization accuracy indicator
     # -------------------------------------------------------------------
-    # Paper Section 5.2.1: "correctly identified obfuscation type for
-    # 11 of 12 defenses (91.7%)"
+    # Paper Section 5.2.1 discusses identification accuracy; we report the
+    # model-specific confidence score as a local proxy.
     obf_types = characterization.to_dict().get("obfuscation_types") or []
     confidence = float(characterization.to_dict().get("confidence", 0.0))
 
     if obf_types and confidence >= 0.7:
         logger.info(
             "High-confidence characterization (%.1f%%) achieved. "
-            "Paper Section 5.2.1: NeurInSpectre achieves 91.7%% identification accuracy.",
+            "Paper Section 5.2.1: see paper for aggregate study-level results.",
             confidence * 100,
         )
     elif obf_types and confidence < 0.7:

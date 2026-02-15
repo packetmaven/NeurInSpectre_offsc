@@ -282,9 +282,6 @@ class _BaseRunner:
 
 class _PGDAttackRunner(_BaseRunner):
     def __init__(self, model, cfg: AttackConfig, device: str = "cpu"):
-        alpha = float(cfg.step_size) if cfg.step_size is not None else 2 / 255
-        if cfg.step_size is None:
-            cfg.step_size = alpha
         if cfg.n_restarts > 1:
             attack = PGDWithRestarts(cfg, n_restarts=cfg.n_restarts, device=device)
         else:

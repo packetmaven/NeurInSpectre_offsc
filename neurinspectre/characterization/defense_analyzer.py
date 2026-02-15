@@ -508,17 +508,11 @@ class DefenseAnalyzer:
         norm_ratio_mean = float(spectral_signals.get("norm_ratio_mean", 1.0))
         norm_growth_fraction = float(spectral_signals.get("norm_growth_fraction", 0.0))
 
-        if (
-            rel_error_mean >= self.KRYLOV_REL_ERROR_SHATTERED
-            or norm_growth_fraction >= self.KRYLOV_NORM_GROWTH_SHATTERED
-        ):
-            if ObfuscationType.SHATTERED not in obfuscation_types:
-                obfuscation_types.append(ObfuscationType.SHATTERED)
-                if self.verbose:
-                    print(
-                        "  [DETECTED] Spectral anomaly (Krylov rel_error="
-                        f"{rel_error_mean:.3f}, growth={norm_growth_fraction:.3f})"
-                    )
+        # Note: we compute Krylov diagnostics for reporting and future analysis,
+        # but we do not classify "SHATTERED" purely from reconstruction error /
+        # norm growth. In practice those signals are highly sensitive to generic
+        # non-stationarity (even for clean models) and need careful calibration
+        # on real, task-specific gradients.
 
         if norm_ratio_mean <= self.KRYLOV_NORM_RATIO_VANISHING:
             if ObfuscationType.VANISHING not in obfuscation_types:

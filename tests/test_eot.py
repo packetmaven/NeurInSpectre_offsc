@@ -97,10 +97,46 @@ def test_eot_variance_reduction():
     delta = torch.zeros_like(x, requires_grad=True)
 
     attack_uniform = EOT(model, transform, num_samples=20, importance_sampling=False, device="cpu")
-    grad_uniform, _ = attack_uniform._uniform_gradients(x, delta, y)
+    grad_uniform, n_uniform = attack_uniform._uniform_gradients(x, delta, y)
 
     attack_importance = EOT(model, transform, num_samples=20, importance_sampling=True, device="cpu")
-    grad_importance, _ = attack_importance._importance_weighted_gradients(x, delta, y)
+    grad_importance, divisor = attack_importance._importance_weighted_gradients(x, delta, y)
+
+    assert int(n_uniform) == 20
+    # Importance-weighted gradients are already a mean (weights sum to 1),
+    # so the forward path should not divide by an "effective N".
+    assert int(divisor) == 1
+    assert hasattr(attack_importance, "_last_effective_n")
+    assert 1.0 <= float(getattr(attack_importance, "_last_effective_n")) <= 20.0
 
     assert grad_uniform.abs().sum() > 0
     assert grad_importance.abs().sum() > 0
+
+
+def test_eot_importance_weights_favor_higher_loss():
+    weights = EOT._compute_importance_weights(
+        [0.1, 0.5, 2.0, 1.0],
+        temperature=0.2,
+        device="cpu",
+    )
+    assert torch.isclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+    # Highest loss (2.0) should get highest weight.
+    assert int(weights.argmax().item()) == 2
+
+
+def test_eot_importance_effective_n_equals_num_samples_for_deterministic_transform():
+    model = SimpleConv()
+
+    def transform(x):
+        return x
+
+    x = torch.rand(2, 3, 32, 32)
+    y = torch.tensor([0, 1])
+    delta = torch.zeros_like(x, requires_grad=True)
+
+    attack = EOT(model, transform, num_samples=10, importance_sampling=True, device="cpu")
+    _grad, divisor = attack._importance_weighted_gradients(x, delta, y)
+
+    assert int(divisor) == 1
+    assert hasattr(attack, "_last_effective_n")
+    assert abs(float(getattr(attack, "_last_effective_n")) - 10.0) < 1e-6

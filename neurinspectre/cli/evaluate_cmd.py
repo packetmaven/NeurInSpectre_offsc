@@ -1,29 +1,12 @@
 """
 Evaluation command implementation for NeurInSpectre CLI.
 
-Implements comprehensive defense evaluation suite from Paper Section 5.
-Evaluates multiple defenses against ensemble of attacks with:
-  - Parallel execution (Enhancement #8)
-  - Rich progress reporting (Enhancement #11)
-  - Attack orchestration (APGD-CE, APGD-DLR, NeurInSpectre, Square)
-  - Cross-product evaluation matrix (defenses x attacks)
+Runs an evaluation matrix (defenses x attacks) over real datasets/models and
+produces JSON summaries plus a terminal report.
 
-PAPER ALIGNMENT:
-- Evaluates N defenses x M attacks from config YAML
-- Table 1 reproduction pipeline (12 defenses, 4 attacks per defense)
-- Coordinated evaluation per Paper Section 3.3
-- Ensemble methodology per AutoAttack integration
-
-ENHANCEMENTS:
-#8  - ThreadPoolExecutor for parallel (defense, attack) pair evaluation
-#11 - Rich progress bars with real-time ASR/RA updates per pair
-
-Cross-ref: Paper Section 5 "Evaluation"
-Cross-ref: Paper Table 1 "Attack success rate against evaluated defenses"
-Cross-ref: Paper Section 3.3 "Phase 3: Coordinated Evaluation"
-Cross-ref: Paper Section 4 "Implementation" (parallelization)
-
-Version: 2.0.1 (WOOT 2026 submission aligned)
+This repo intentionally does not ship paper baseline numbers; any baseline/expected
+values must be supplied via external files (see: `baseline_validation` config or
+`neurinspectre compare --mode baseline --expected-asr-path ...`).
 """
 
 from __future__ import annotations
@@ -38,7 +21,15 @@ from typing import Any, Dict, List, Tuple
 import click
 
 from ..attacks import AttackFactory
+from ..evaluation.baseline_validation import (
+    build_observed_asr_matrix,
+    load_expected_asr,
+    validate_asr_matrix,
+)
+from ..evaluation.artifact_integrity import nuscenes_label_map_hash_gate
+from ..evaluation.budgets import get_attack_budgets, resolve_attack_config
 from ..evaluation.datasets import DatasetFactory
+from ..evaluation.validity_gates import evaluate_clean_validity, resolve_validity_gates
 from .exporters import export_evaluation_json, export_evaluation_sarif
 from .formatters import build_console, render_evaluation_report
 from .progress import ProgressReporter
@@ -87,6 +78,7 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
             ctx.obj["verbose"] = max(int(ctx.obj.get("verbose", 0)), cmd_verbose)
     device = resolve_device(kwargs.get("device", "cpu"))
     config_path = kwargs.get("config")
+    config_base_dir = Path(str(config_path)).resolve().parent
     config = load_yaml(config_path)
 
     quiet = bool(ctx.obj.get("quiet", False)) if ctx and ctx.obj else False
@@ -131,7 +123,7 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
         )
     else:
         logger.info(
-            "Evaluation matrix: %d defenses x %d attacks (Paper Table 1 default: %d x %d).",
+            "Evaluation matrix: %d defenses x %d attacks (default: %d x %d).",
             len(defenses),
             len(attacks),
             DEFAULT_NUM_DEFENSES,
@@ -139,6 +131,8 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
         )
 
     base_attack_cfg = _base_attack_config(config)
+    validity_gates = resolve_validity_gates(config)
+    strict_fail_fast = bool(validity_gates.get("enabled")) and bool(validity_gates.get("strict"))
 
     results: List[Dict[str, Any]] = []
     start_time = time.time()
@@ -167,6 +161,7 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
                         out_dir,
                         resume,
                         seed,
+                        config_base_dir,
                         None,
                     ): defense
                     for defense in defenses
@@ -183,6 +178,11 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
                             description=f"Evaluation suite... [{defense_name}: ASR={avg_asr:.1%}]",
                         )
                     except Exception as exc:
+                        if strict_fail_fast:
+                            # In strict validity mode, do not publish partial or meaningless results.
+                            if isinstance(exc, click.ClickException):
+                                raise
+                            raise click.ClickException(str(exc)) from exc
                         logger.error(
                             "Defense %s failed: %s",
                             defense_name,
@@ -201,6 +201,7 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
                         out_dir,
                         resume,
                         seed,
+                        config_base_dir,
                         progress.advance,
                     )
                 )
@@ -214,8 +215,21 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
         },
     }
     summary["highlights"] = _summarize_evaluation_findings(results, config=config)
+    baseline_report = _run_baseline_validation(
+        results,
+        config=config,
+        config_path=config_path,
+    )
+    summary["baseline_validation"] = baseline_report
     save_json(summary, out_dir / "summary.json")
     click.echo(f"Evaluation summary written to {out_dir / 'summary.json'}")
+
+    if baseline_report.get("enabled") and baseline_report.get("strict") and not baseline_report.get("passed", False):
+        raise click.ClickException(
+            "Baseline validation failed: "
+            f"{baseline_report.get('failed_count', 0)} pairs out of tolerance, "
+            f"{baseline_report.get('missing_expected_count', 0)} missing expected pairs."
+        )
 
     report = bool(kwargs.get("report", True))
     brief = bool(kwargs.get("brief", False))
@@ -353,15 +367,42 @@ def _summarize_evaluation_findings(
         for entry in entries
         if entry[0] >= 0.5 or entry[1] >= 0.3
     ]
-    epsilon = config.get("perturbation", {}).get("epsilon", 8 / 255)
-    norm = config.get("perturbation", {}).get("norm", "Linf")
+    invalid = 0
+    for res in results:
+        attacks = res.get("attacks", {}) or {}
+        for _attack, metrics in attacks.items():
+            validity = (metrics or {}).get("validity") if isinstance(metrics, dict) else None
+            if isinstance(validity, dict) and validity.get("enabled") and not validity.get("passed", True):
+                invalid += 1
+    # If dataset-specific budgets are configured, report them instead of the global
+    # perturbation defaults (which can be misleading for multi-dataset Table2 runs).
+    threat_line = None
+    budgets = get_attack_budgets(config)
+    datasets_seen = sorted({str(r.get("dataset")) for r in results if r.get("dataset")})
+    if budgets and datasets_seen:
+        parts: List[str] = []
+        for dataset_name in datasets_seen:
+            budget = dict(budgets.get(dataset_name, {}) or {})
+            eps = budget.get("epsilon", budget.get("eps"))
+            norm = budget.get("norm")
+            if eps is None and norm is None:
+                continue
+            parts.append(f"{dataset_name} norm={norm} eps={eps}")
+        if parts:
+            threat_line = f"Threat model: {', '.join(parts)}"
+    if not threat_line:
+        epsilon = config.get("perturbation", {}).get("epsilon", 8 / 255)
+        norm = config.get("perturbation", {}).get("norm", "Linf")
+        threat_line = f"Threat model: norm={norm}, epsilon={epsilon}"
 
     lines = [
-        f"Threat model: norm={norm}, epsilon={epsilon}",
+        threat_line,
         f"Top compromise pairs (ASR): {top_str}" if top_str else "Top compromise pairs (ASR): n/a",
         f"Weakest defenses (best attack ASR): {weak_str}" if weak_str else "Weakest defenses: n/a",
         f"Flagged pairs (ASR>=0.5 or drop>=0.3): {len(flagged)}/{len(entries)}",
     ]
+    if invalid:
+        lines.append(f"Validity warnings: {invalid} pairs have low clean accuracy / too few clean-correct samples")
     return tuple(lines)
 
 
@@ -379,6 +420,63 @@ def _evaluation_pairs(results: List[Dict[str, Any]]) -> List[Tuple[str, str, flo
     return pairs
 
 
+def _run_baseline_validation(
+    results: List[Dict[str, Any]],
+    *,
+    config: Dict[str, Any],
+    config_path: str | None,
+) -> Dict[str, Any]:
+    validation_cfg = dict(config.get("baseline_validation", {}) or {})
+    if not validation_cfg or not bool(validation_cfg.get("enabled", False)):
+        return {"enabled": False}
+
+    base_dir = Path(config_path).parent if config_path else None
+    expected = load_expected_asr(validation_cfg, base_dir=base_dir)
+    strict = bool(validation_cfg.get("strict", False))
+    if not expected:
+        if strict:
+            return {
+                "enabled": True,
+                "strict": True,
+                "passed": False,
+                "reason": "missing_expected_asr",
+                "failed_count": 0,
+                "missing_expected_count": 0,
+            }
+        return {
+            "enabled": True,
+            "strict": False,
+            "passed": False,
+            "reason": "missing_expected_asr",
+            "failed_count": 0,
+            "missing_expected_count": 0,
+        }
+
+    observed_rows: List[Tuple[str, str, float]] = []
+    for res in results:
+        defense = str(res.get("defense", res.get("type", "defense")))
+        attacks = res.get("attacks", {}) or {}
+        for attack_name, metrics in attacks.items():
+            observed_rows.append(
+                (
+                    defense,
+                    str(attack_name),
+                    float(metrics.get("attack_success_rate", 0.0)),
+                )
+            )
+    tolerance = float(validation_cfg.get("tolerance", 0.02))
+    require_all = bool(validation_cfg.get("require_all_expected", True))
+    report = validate_asr_matrix(
+        build_observed_asr_matrix(observed_rows),
+        expected,
+        tolerance=tolerance,
+        require_all_expected=require_all,
+    )
+    report["enabled"] = True
+    report["strict"] = strict
+    return report
+
+
 def _evaluate_defense(
     defense_entry: Dict[str, Any],
     attacks: List[Dict[str, Any]],
@@ -388,6 +486,7 @@ def _evaluate_defense(
     out_dir: Path,
     resume: bool,
     seed: int,
+    config_base_dir: Path,
     progress_callback: Any,
 ) -> Dict[str, Any]:
     defense_name = defense_entry.get("name", defense_entry.get("type", "defense"))
@@ -406,18 +505,91 @@ def _evaluate_defense(
     num_samples = int(dataset_cfg.get("num_samples", dataset_cfg.get("n_samples", DEFAULT_EVAL_SAMPLES)))
     batch_size = int(dataset_cfg.get("batch_size", base_attack_cfg.get("batch_size", 128)))
     num_workers = int(dataset_cfg.get("num_workers", 4))
+    split = str(dataset_cfg.get("split", "test"))
+    labels_path = dataset_cfg.get("labels_path")
+    nuscenes_version = dataset_cfg.get("version") or dataset_cfg.get("nuscenes_version")
+
+    def _resolve_existing_path(raw_path: str) -> Path:
+        p = Path(raw_path)
+        if p.is_absolute():
+            return p
+        cwd_candidate = Path.cwd() / p
+        if cwd_candidate.exists():
+            return cwd_candidate
+        cfg_candidate = config_base_dir / p
+        if cfg_candidate.exists():
+            return cfg_candidate
+        return cfg_candidate
 
     loader, _x, _y = load_dataset(
         dataset_name,
         data_path=dataset_cfg.get("data_path"),
+        labels_path=labels_path,
+        nuscenes_version=nuscenes_version,
         num_samples=num_samples,
         batch_size=batch_size,
         seed=seed,
         num_workers=num_workers,
+        split=split,
         device=device,
     )
 
     model_ref = _resolve_model_ref(defense_entry, config, dataset_name)
+
+    # Optional artifact integrity gate (AE-friendly): prevent silent nuScenes label-map mismatch.
+    validity_gates = resolve_validity_gates(config)
+    integrity: Dict[str, Any] = {}
+    if (
+        str(dataset_name).lower() == "nuscenes"
+        and bool(validity_gates.get("enabled", False))
+        and bool(validity_gates.get("require_label_map_sha256_match", False))
+    ):
+        if not labels_path:
+            integrity_report: Dict[str, Any] = {
+                "enabled": True,
+                "passed": False,
+                "reasons": ["missing_labels_path_config"],
+            }
+        else:
+            resolved_labels_path = _resolve_existing_path(str(labels_path))
+
+            model_path: Path | None = None
+            if isinstance(model_ref, (str, Path)):
+                candidate = _resolve_existing_path(str(model_ref))
+                if candidate.exists():
+                    model_path = candidate
+            elif isinstance(model_ref, dict):
+                path_val = (
+                    model_ref.get("path")
+                    or model_ref.get("checkpoint_path")
+                    or model_ref.get("weights_path")
+                )
+                if path_val:
+                    candidate = _resolve_existing_path(str(path_val))
+                    if candidate.exists():
+                        model_path = candidate
+
+            if model_path is None:
+                integrity_report = {
+                    "enabled": True,
+                    "passed": False,
+                    "reasons": ["missing_model_path_for_hash_gate"],
+                    "hint": "Provide an explicit nuScenes TorchScript path (and its .meta.json) to enable label-map hashing.",
+                    "labels_path": str(resolved_labels_path),
+                }
+            else:
+                integrity_report = nuscenes_label_map_hash_gate(
+                    model_path=str(model_path),
+                    labels_path=str(resolved_labels_path),
+                )
+
+        integrity["nuscenes_label_map_hash"] = integrity_report
+        if bool(validity_gates.get("strict", False)) and not bool(integrity_report.get("passed", False)):
+            raise click.ClickException(
+                "nuScenes label-map hash gate failed (model/label_map mismatch or missing metadata). "
+                f"defense={defense_name} reasons={','.join(integrity_report.get('reasons', []) or [])}"
+            )
+
     model = load_model(model_ref, dataset=dataset_name, device=device)
 
     defense_params = {
@@ -441,6 +613,14 @@ def _evaluate_defense(
             if "defense" in loaded and isinstance(loaded["defense"], dict):
                 loaded = loaded["defense"]
             defense_params.update(loaded)
+
+    # Support configs that nest defense kwargs under a ``params`` dictionary.
+    # Table2 spec-style YAMLs frequently use this convention.
+    nested_params = defense_params.pop("params", None)
+    if isinstance(nested_params, dict):
+        # Prefer explicit top-level keys if both are provided.
+        for k, v in nested_params.items():
+            defense_params.setdefault(k, v)
     defense_model = build_defense(defense_type, model, defense_params, device=device)
     eval_model = defense_model or model
 
@@ -457,12 +637,38 @@ def _evaluate_defense(
                 if k not in {"name", "type"}
             }
         )
+        # Allow per-attack ``steps`` to override the global ``iterations`` default.
+        # ``AttackFactory._to_attack_config`` prefers ``n_iterations`` over ``steps``,
+        # so we map it explicitly here.
+        if "steps" in attack_entry and "n_iterations" not in attack_entry:
+            try:
+                attack_cfg["n_iterations"] = int(attack_entry.get("steps"))  # type: ignore[arg-type]
+            except Exception:
+                pass
+        attack_cfg = resolve_attack_config(
+            config,
+            attack_cfg=attack_cfg,
+            dataset_name=dataset_name,
+            strict_budget=bool(config.get("strict_dataset_budgets", False)),
+        )
+        attack_key = str(attack_name).lower()
+        # For baseline attacks (PGD/APGD/AutoAttack/...), the attack target is the
+        # *defended* model. For BPDA/EOT/Hybrid/NeurInSpectre, we need both the
+        # base model and the defense wrapper so the attack can use transform()
+        # and/or BPDA approximations.
+        if attack_key in {"bpda", "eot", "hybrid", "neurinspectre"}:
+            attack_model = model
+            attack_defense = defense_model
+        else:
+            attack_model = eval_model
+            attack_defense = None
+
         runner = AttackFactory.create_attack(
-            attack_name,
-            model,
+            attack_key,
+            attack_model,
             config=attack_cfg,
-            characterization_loader=loader if attack_name == "neurinspectre" else None,
-            defense=defense_model,
+            characterization_loader=loader if attack_key == "neurinspectre" else None,
+            defense=attack_defense,
             device=device,
         )
         summary = evaluate_attack_runner(
@@ -474,6 +680,19 @@ def _evaluate_defense(
             targeted=bool(attack_cfg.get("targeted", False)),
             norm=attack_cfg.get("norm", "Linf"),
         )
+        gates = resolve_validity_gates(config)
+        validity = evaluate_clean_validity(summary, gates)
+        if validity.get("enabled"):
+            summary["validity"] = validity
+            if bool(gates.get("strict", False)) and not bool(validity.get("passed", False)):
+                raise click.ClickException(
+                    "Validity gate failed (clean accuracy too low for meaningful ASR). "
+                    f"dataset={dataset_name} defense={defense_name} attack={attack_name} "
+                    f"clean_acc={float(validity.get('observed', {}).get('clean_accuracy', 0.0)):.3f} "
+                    f"correct={int(validity.get('observed', {}).get('correct_samples', 0))}/"
+                    f"{int(validity.get('observed', {}).get('samples', 0))} "
+                    f"reasons={','.join(validity.get('reasons', []) or [])}"
+                )
         attack_results[attack_name] = summary
 
         if progress_callback:
@@ -497,6 +716,8 @@ def _evaluate_defense(
         "attacks": attack_results,
         "characterization": characterization,
     }
+    if integrity:
+        result["integrity"] = integrity
     save_json(result, output_path)
     return result
 

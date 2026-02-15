@@ -39,10 +39,74 @@ def bpda_jpeg(x: torch.Tensor, quality: int = 75) -> torch.Tensor:
 
 
 @register_bpda("thermometer")
-def bpda_thermometer(x: torch.Tensor, levels: int = 16) -> torch.Tensor:
-    """Thermometer encoding approximation via STE."""
-    x_quantized = torch.round(x * levels) / levels
-    return x + (x_quantized - x).detach()
+def bpda_thermometer(x: torch.Tensor, levels: int = 16, tau: float = 10.0) -> torch.Tensor:
+    """
+    Shape-preserving thermometer-style approximation with STE.
+
+    This is a *shape-preserving* approximation (returns same shape as `x`) by
+    averaging thermometer bits across levels. It is appropriate for defenses
+    that behave like quantization / feature squeezing.
+
+    For true thermometer encoding defenses that *expand channels* (e.g.,
+    (B,C,H,W)->(B,C*L,H,W)), use `bpda_thermometer_bits`.
+    """
+    levels = int(max(2, levels))
+    x_clamped = torch.clamp(x, 0.0, 1.0)
+
+    if x_clamped.ndim >= 4:
+        # (B, C, H, W) -> (B, C, L, H, W)
+        thresholds = torch.arange(1, levels + 1, device=x.device, dtype=x.dtype) / levels
+        thresholds = thresholds.view(1, 1, levels, 1, 1)
+        x_expanded = x_clamped.unsqueeze(2)
+        hard = (x_expanded >= thresholds).to(x.dtype)
+        soft = torch.sigmoid((x_expanded - thresholds) * float(tau))
+        encoded = soft + (hard - soft).detach()
+        return encoded.mean(dim=2)
+
+    # Generic path for tabular/flat inputs, e.g., (B, D)
+    thresholds = torch.arange(1, levels + 1, device=x.device, dtype=x.dtype) / levels
+    view_shape = (1,) * x_clamped.ndim + (levels,)
+    thresholds = thresholds.view(*view_shape)
+    x_expanded = x_clamped.unsqueeze(-1)
+    hard = (x_expanded >= thresholds).to(x.dtype)
+    soft = torch.sigmoid((x_expanded - thresholds) * float(tau))
+    encoded = soft + (hard - soft).detach()
+    return encoded.mean(dim=-1)
+
+
+@register_bpda("thermometer_bits")
+def bpda_thermometer_bits(x: torch.Tensor, levels: int = 16, tau: float = 10.0) -> torch.Tensor:
+    """
+    Channel-expanding thermometer encoding approximation with STE.
+
+    Returns:
+      - Image-like input (B, C, H, W) -> (B, C*levels, H, W)
+      - Flat input (B, D) -> (B, D*levels)
+    """
+    levels = int(max(2, levels))
+    x_clamped = torch.clamp(x, 0.0, 1.0)
+
+    if x_clamped.ndim >= 4:
+        thresholds = torch.arange(1, levels + 1, device=x.device, dtype=x.dtype) / levels
+        thresholds = thresholds.view(1, 1, levels, 1, 1)
+        x_expanded = x_clamped.unsqueeze(2)
+        hard = (x_expanded >= thresholds).to(x.dtype)
+        soft = torch.sigmoid((x_expanded - thresholds) * float(tau))
+        encoded = soft + (hard - soft).detach()  # (B, C, L, H, W)
+        b, c, _l, h, w = encoded.shape
+        return encoded.view(b, c * levels, h, w)
+
+    if x_clamped.ndim == 2:
+        thresholds = torch.arange(1, levels + 1, device=x.device, dtype=x.dtype) / levels
+        thresholds = thresholds.view(1, 1, levels)
+        x_expanded = x_clamped.unsqueeze(-1)  # (B, D, 1)
+        hard = (x_expanded >= thresholds).to(x.dtype)
+        soft = torch.sigmoid((x_expanded - thresholds) * float(tau))
+        encoded = soft + (hard - soft).detach()  # (B, D, L)
+        return encoded.reshape(int(x.shape[0]), int(x.shape[1]) * levels)
+
+    # Other shapes are unusual for thermometer encoding; keep the failure explicit.
+    raise ValueError(f"bpda_thermometer_bits expects (B,C,H,W) or (B,D), got shape={tuple(x.shape)}")
 
 
 @register_bpda("quantization")

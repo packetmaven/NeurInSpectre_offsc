@@ -11,7 +11,7 @@ AutoAttack baselines and across evaluation runs, enabling:
 
 PAPER ALIGNMENT:
 - Paper Table 1: NeurInSpectre vs PGD vs AutoAttack comparison
-- Paper Section 5.2.2: "outperforms AutoAttack by 29.5 pp on average"
+- Paper Section 5.2.2: comparison vs AutoAttack (no in-repo baseline numbers)
 - Paper Table 2: Ablation component comparison
 - Paper Table 3: Detection capability comparison across methods
 
@@ -37,6 +37,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from ..evaluation.baseline_validation import (
+    build_observed_asr_matrix,
+    load_expected_asr,
+    validate_asr_matrix,
+)
 from .exporters import export_compare_json, export_compare_sarif
 from .formatters import build_console
 from .utils import save_json
@@ -44,21 +49,6 @@ from .utils import save_json
 logger = logging.getLogger(__name__)
 
 COMPARE_MODES = ("attacks", "defenses", "runs", "baseline", "characterization")
-
-PAPER_TABLE1_DEFENSE_ASR = {
-    "jpegcompression": {"pgd": 0.124, "autoattack": 0.673, "neurinspectre": 0.982},
-    "bitdepthreduction": {"pgd": 0.087, "autoattack": 0.718, "neurinspectre": 0.974},
-    "randsmoothing": {"pgd": 0.312, "autoattack": 0.584, "neurinspectre": 0.893},
-    "ensemblediversity": {"pgd": 0.246, "autoattack": 0.621, "neurinspectre": 0.917},
-    "featuresqueezing": {"pgd": 0.153, "autoattack": 0.694, "neurinspectre": 0.968},
-    "gradientreg": {"pgd": 0.412, "autoattack": 0.732, "neurinspectre": 0.884},
-    "defdistillation": {"pgd": 0.062, "autoattack": 0.521, "neurinspectre": 0.946},
-    "attransform": {"pgd": 0.387, "autoattack": 0.719, "neurinspectre": 0.921},
-    "spatialsmoothing": {"pgd": 0.221, "autoattack": 0.658, "neurinspectre": 0.953},
-    "randompadcrop": {"pgd": 0.184, "autoattack": 0.592, "neurinspectre": 0.937},
-    "thermometerenc": {"pgd": 0.098, "autoattack": 0.486, "neurinspectre": 0.961},
-    "certifieddefense": {"pgd": 0.523, "autoattack": 0.784, "neurinspectre": 0.978},
-}
 
 
 def run_compare(ctx: click.Context, **kwargs: Any) -> None:
@@ -78,6 +68,7 @@ def run_compare(ctx: click.Context, **kwargs: Any) -> None:
 
     sort_by = str(kwargs.get("sort_by", "asr"))
     threshold_pp = float(kwargs.get("threshold", 2.0))
+    expected_asr_path = kwargs.get("expected_asr_path")
     report_format = str(kwargs.get("report_format", "rich"))
     no_color = bool(kwargs.get("no_color", False))
     force_color = bool(kwargs.get("color", False))
@@ -92,7 +83,11 @@ def run_compare(ctx: click.Context, **kwargs: Any) -> None:
     elif mode == "runs":
         payload = _compare_runs(datasets, threshold_pp=threshold_pp)
     elif mode == "baseline":
-        payload = _compare_baseline(datasets)
+        payload = _compare_baseline(
+            datasets,
+            expected_asr_path=str(expected_asr_path) if expected_asr_path else None,
+            tolerance_pp=threshold_pp,
+        )
     else:
         payload = _compare_characterization(datasets, sort_by=sort_by)
 
@@ -178,35 +173,92 @@ def _compare_runs(datasets: List[Dict[str, Any]], *, threshold_pp: float) -> Dic
     return {"comparisons": comparisons, "threshold_pp": threshold_pp, "findings": findings}
 
 
-def _compare_baseline(datasets: List[Dict[str, Any]]) -> Dict[str, Any]:
-    pairs = _extract_pairs(datasets)
-    comparisons = []
-    findings = []
-    for defense, attack, metrics in pairs:
-        key = _normalize_defense_key(defense)
-        baseline = PAPER_TABLE1_DEFENSE_ASR.get(key, {})
-        if not baseline:
-            continue
-        base_asr = float(baseline.get(attack, 0.0))
-        obs_asr = float(metrics.get("attack_success_rate", 0.0))
-        delta = obs_asr - base_asr
+def _compare_baseline(
+    datasets: List[Dict[str, Any]],
+    *,
+    expected_asr_path: str | None,
+    tolerance_pp: float,
+) -> Dict[str, Any]:
+    """
+    Compare observed ASR values to an expected baseline map provided externally.
+
+    Note: This project intentionally does not ship paper baselines in-repo. Users
+    must provide a baseline file (YAML/JSON) via --expected-asr-path.
+    """
+    if not expected_asr_path:
+        raise click.ClickException(
+            "Baseline comparison requires --expected-asr-path/--expected-asr. "
+            "NeurInSpectre does not ship paper baselines in-repo."
+        )
+
+    expected = load_expected_asr(
+        {"expected_asr_path": expected_asr_path},
+        base_dir=Path.cwd(),
+    )
+    if not expected:
+        raise click.ClickException(f"No expected ASR map loaded from: {expected_asr_path}")
+
+    observed_rows: List[Tuple[str, str, float]] = []
+
+    def _walk(item: Dict[str, Any]) -> None:
+        if "results" in item and isinstance(item.get("results"), list):
+            for res in item.get("results") or []:
+                if isinstance(res, dict):
+                    _walk(res)
+            return
+        attacks = item.get("attacks")
+        if isinstance(attacks, dict):
+            # Prefer defense *type* for baseline matching (stable across run naming).
+            defense_key = str(item.get("type") or item.get("defense") or "defense")
+            for attack_name, metrics in attacks.items():
+                try:
+                    asr = float((metrics or {}).get("attack_success_rate", 0.0))
+                except Exception:
+                    asr = 0.0
+                observed_rows.append((defense_key, str(attack_name), asr))
+
+    for data in datasets:
+        if isinstance(data, dict):
+            _walk(data)
+
+    tolerance = float(tolerance_pp) / 100.0
+    report = validate_asr_matrix(
+        build_observed_asr_matrix(observed_rows),
+        expected,
+        tolerance=tolerance,
+        require_all_expected=False,
+    )
+
+    comparisons: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
+    for row in report.get("rows", []) or []:
+        delta = row.get("delta")
         comparisons.append(
             {
-                "defense": defense,
-                "attack": attack,
-                "baseline_asr": base_asr,
-                "observed_asr": obs_asr,
+                "defense": row.get("defense"),
+                "attack": row.get("attack"),
+                "baseline_asr": row.get("expected_asr"),
+                "observed_asr": row.get("observed_asr"),
                 "delta": delta,
+                "within_tolerance": row.get("within_tolerance"),
             }
         )
-        if abs(delta) >= 0.02:
+        if delta is None:
+            continue
+        if abs(float(delta)) >= tolerance:
             findings.append(
                 {
-                    "level": "warning" if abs(delta) < 0.3 else "error",
-                    "message": f"{defense} vs {attack} baseline delta={delta:.3f}",
+                    "level": "warning" if abs(float(delta)) < 0.3 else "error",
+                    "message": f"{row.get('defense')} vs {row.get('attack')} baseline delta={float(delta):+.3f} (tol={tolerance_pp:.1f}pp)",
                 }
             )
-    return {"comparisons": comparisons, "findings": findings}
+    return {
+        "expected_asr_path": expected_asr_path,
+        "tolerance_pp": float(tolerance_pp),
+        "comparisons": comparisons,
+        "findings": findings,
+        "missing_expected_count": int(report.get("missing_expected_count", 0) or 0),
+    }
 
 
 def _compare_characterization(datasets: List[Dict[str, Any]], *, sort_by: str) -> Dict[str, Any]:
@@ -308,7 +360,7 @@ def _render_runs_comparison(console: Console, payload: Dict[str, Any]) -> None:
 
 def _render_baseline_comparison(console: Console, payload: Dict[str, Any]) -> None:
     comparisons = payload.get("comparisons", []) or []
-    console.rule("Paper Table 1 Baseline Comparison")
+    console.rule("Baseline Comparison (external expected ASR)")
     table = Table(box=box.HEAVY_HEAD, header_style="bold cyan")
     table.add_column("Defense", style="white", width=18)
     table.add_column("Attack", style="white", width=14)
@@ -316,14 +368,21 @@ def _render_baseline_comparison(console: Console, payload: Dict[str, Any]) -> No
     table.add_column("Observed", justify="center", width=10)
     table.add_column("Delta", justify="center", width=10)
     for row in comparisons:
-        delta = float(row.get("delta", 0.0))
-        color = "red" if abs(delta) >= 0.02 else "green"
+        tol = float(payload.get("tolerance_pp", 2.0)) / 100.0
+        delta_raw = row.get("delta")
+        if delta_raw is None:
+            delta_str = "n/a"
+            color = "yellow"
+        else:
+            delta = float(delta_raw)
+            delta_str = f"{delta:+.3f}"
+            color = "red" if abs(delta) >= tol else "green"
         table.add_row(
             str(row.get("defense")),
             str(row.get("attack")),
             _fmt(row.get("baseline_asr")),
             _fmt(row.get("observed_asr")),
-            f"[{color}]{delta:+.3f}[/{color}]",
+            f"[{color}]{delta_str}[/{color}]",
         )
     console.print(table)
 
@@ -429,34 +488,6 @@ def _extract_characterizations(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _pair_map(pairs: List[Tuple[str, str, Dict[str, Any]]]) -> Dict[Tuple[str, str], float]:
     return {(d, a): float(m.get("attack_success_rate", 0.0)) for d, a, m in pairs}
-
-
-def _normalize_defense_key(defense: str) -> str:
-    key = str(defense).lower().replace("_", "").replace("-", "").replace(" ", "")
-    alias = {
-        "jpeg": "jpegcompression",
-        "jpegcompression": "jpegcompression",
-        "bitdepth": "bitdepthreduction",
-        "bitdepthreduction": "bitdepthreduction",
-        "bitdepthreductiondefense": "bitdepthreduction",
-        "randomizedsmoothing": "randsmoothing",
-        "randsmooth": "randsmoothing",
-        "randsmoothing": "randsmoothing",
-        "ensemblediversity": "ensemblediversity",
-        "featuresqueezing": "featuresqueezing",
-        "feature_squeezing": "featuresqueezing",
-        "gradientregularization": "gradientreg",
-        "gradientreg": "gradientreg",
-        "defensivedistillation": "defdistillation",
-        "distillation": "defdistillation",
-        "attransform": "attransform",
-        "spatialsmoothing": "spatialsmoothing",
-        "randompadcrop": "randompadcrop",
-        "thermometerencoding": "thermometerenc",
-        "thermometerenc": "thermometerenc",
-        "certifieddefense": "certifieddefense",
-    }
-    return alias.get(key, key)
 
 
 def _fmt(value: Any) -> str:

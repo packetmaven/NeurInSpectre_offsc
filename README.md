@@ -8,7 +8,6 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3-green.svg)](https://developer.apple.com/metal/)
 [![NVIDIA CUDA](https://img.shields.io/badge/NVIDIA-CUDA-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-[![Security](https://img.shields.io/badge/Security%20Tests-96.7%25-brightgreen.svg)](https://github.com/packetmaven/NeurInSpectre_branch2)
 
 > **A neural network security analysis framework for offensive and defensive AI security operations and AI interpretability.**
 
@@ -323,20 +322,20 @@ neurinspectre --version
 ### Basic Usage
 
 ```bash
-# Run adaptive attack (Paper Algorithm 2)
+# Run adaptive attack
 neurinspectre attack \
     --model resnet50.pth \
     --dataset cifar10 \
     --defense jpeg \
     --epsilon 0.03
 
-# Characterize defense (Paper Algorithm 1)
+# Characterize a defense
 neurinspectre characterize \
     --model resnet50.pth \
     --dataset cifar10 \
     --defense randsmooth
 
-# Full evaluation suite (Paper Section 5)
+# Run an evaluation suite
 neurinspectre evaluate --config evaluation.yaml
 ```
 
@@ -348,14 +347,14 @@ Generate example configs:
 # Attack configuration
 neurinspectre config attack > attack.yaml
 
-# Full evaluation (Paper Table 1)
+# Full evaluation config
 neurinspectre config evaluation > evaluation.yaml
 ```
 
 ### Example Evaluation Config
 
 ```yaml
-# evaluation.yaml - Reproduce Paper Table 1 results
+# evaluation.yaml - Example evaluation config
 
 defenses:
   - name: jpeg_compression
@@ -368,9 +367,9 @@ defenses:
     num_samples: 100
 
 attacks:
-  - neurinspectre  # Adaptive (Paper Section 3)
+  - neurinspectre  # Adaptive attack synthesis
   - apgd           # Baseline (Croce & Hein 2020)
-  - autoattack     # Comparison (Paper Section 5.2.2)
+  - autoattack     # Comparative baseline attack
 
 datasets:
   cifar10:
@@ -415,52 +414,33 @@ neurinspectre characterize \
   "attack": "neurinspectre_adaptive",
   "defense": "jpeg_compression",
   "dataset": "cifar10",
-  "epsilon": 0.03137,
+  "epsilon": "<float>",
   "norm": "Linf",
   "results": {
-    "attack_success_rate": 0.982,
-    "robust_accuracy": 0.018,
-    "queries": 100,
-    "iterations": 94,
+    "attack_success_rate": "<float 0..1>",
+    "robust_accuracy": "<float 0..1>",
+    "queries": "<int or null>",
+    "iterations": "<int or null>",
     "characterization": {
-      "obfuscation_types": ["SHATTERED"],
-      "gradient_norm": 0.0014,
-      "confidence": 0.95
+      "obfuscation_types": ["<tag>", "..."],
+      "confidence": "<float 0..1>"
     }
-  },
-  "timing": {
-    "total_seconds": 342.1,
-    "per_sample_ms": 342.1
   }
 }
 ```
 
-Cross-ref: Paper Section 5.1 "Experimental Setup"
-
-### Table 1 Evaluation (Real Data)
+### Evaluation (Real Data)
 
 ```bash
-# Full evaluation (all 12 defenses)
-python -m neurinspectre.evaluation.table1_evaluator \
-    --config experiments/configs/table1_config.yaml \
-    --output-dir results/table1 \
-    --n-samples 1000 \
-    --batch-size 100 \
-    --device cuda
+neurinspectre evaluate --config evaluation.yaml --device auto --output-dir results/eval_run
 
-# Evaluate specific defenses only
-python -m neurinspectre.evaluation.table1_evaluator \
-    --defenses jpeg_compression randomized_smoothing defensive_distillation \
-    --n-samples 500
-
-# Disable caching (for debugging)
-python -m neurinspectre.evaluation.table1_evaluator \
-    --no-cache \
-    --n-samples 100
+# Table2-style pipeline runner
+neurinspectre table2 --config table2_config.yaml --device auto --output-dir results/table2_run --strict-real-data
 ```
 
 Notes:
-- This evaluation uses real datasets and real model checkpoints (EMBER, nuScenes). Provide those assets or pass `--allow-missing` to skip unavailable defenses.
+- This evaluation uses real datasets and real model checkpoints. Provide those assets or pass `--allow-missing` to skip unavailable defenses.
+- Baseline/expected numbers are not stored in-repo; supply them via an external file when needed.
 
 <a id="option-2-automated-mac-silicon-setup"></a>
 
@@ -1917,26 +1897,31 @@ Where $H_m \in \mathbb{R}^{m \times m}$ is the upper Hessenberg matrix and $e_1 
 | Direct $e^{\Delta t L}$ | $O(N^3)$ | 10¹⁸ ops — **intractable** |
 | Krylov approximation | $O(mN) + O(m^3)$ | 3×10⁷ ops — **tractable** |
 
-#### 3.4 Nonlinear Terms by Attack Type
+#### 3.4 Obfuscation Dynamics: Conceptual vs Operational
 
-| Attack | $N(u, t)$ | Physical Effect |
-|--------|----------------|-----------------|
-| Clean | $0$ | Pure diffusion |
-| Shattered | $\sigma \cdot \xi(t)$ | White noise forcing |
-| Vanishing | $-\gamma u$ | Exponential decay |
-| Exploding | $+\beta u^3$ | Cubic instability |
-| Stochastic | $\eta(t) \cdot \sin(2\pi t)$ | Time-varying noise |
+Some ETD / stiff-dynamics expositions write down a *hand-picked* nonlinear forcing
+term $N(u,t)$ (e.g., sinusoidal or polynomial terms) to illustrate qualitative
+effects like periodic forcing, damping, or instability.
 
-**Implementation** (`neurinspectre/security/evasion_detection.py` and `neurinspectre/security/integrated_security.py`):
-```python
-def gradient_nonlinear_term(self, u, obfuscation_type='none', noise_level=0.1):
-    if obfuscation_type == 'shattered':
-        return 0.1 * np.random.randn(*u.shape) * (1 + np.abs(u))
-    elif obfuscation_type == 'vanishing':
-        return -0.5 * u
-    elif obfuscation_type == 'exploding':
-        return 0.5 * u
-```
+In NeurInSpectre's *operational* pipeline, we intentionally **do not hard-code a
+parametric $N(u,t)$** for "RL-trained" or "stochastic" obfuscation:
+
+- Real defenses (and RL-trained evasion policies) are generally **state-dependent**
+  and can be **aperiodic**; a fixed $\sin(2\pi t)$ model is at best didactic.
+- For WOOT/AE defensibility, the repo treats "RL-trained"/"stochastic"/"shattered"
+  as **measurement-driven hypotheses** supported by multiple observable signals.
+
+**Implementation (measurement-driven characterization + attack adaptation):**
+
+| Mechanism (hypothesis) | What we measure (examples) | Where it is implemented |
+|---|---|---|
+| Stochastic / randomized | logit variance across repeats; gradient variance | `neurinspectre/characterization/defense_analyzer.py`, `neurinspectre/attacks/eot.py` |
+| Non-Markovian / RL-trained-like | Volterra power-law $\alpha$; autocorrelation timescale | `neurinspectre/mathematical/volterra.py`, `neurinspectre/characterization/defense_analyzer.py`, `neurinspectre/attacks/memory_gradient.py` |
+| Shattered gradients | gradient-norm collapse; Krylov reconstruction / growth anomalies | `neurinspectre/mathematical/krylov.py`, `neurinspectre/characterization/defense_analyzer.py` |
+| Vanishing / dissipative | low effective Jacobian rank; spectral dissipation signals | `neurinspectre/characterization/defense_analyzer.py` |
+
+For a CLI entrypoint that runs this characterization on real datasets/models, use:
+`neurinspectre defense-analyzer --help`.
 
 ---
 
@@ -2506,7 +2491,7 @@ neurinspectre dashboard-manager start --dashboard ttd
 ```
 
 ```bash
-# Paper-aligned attack workflow (real CLI outputs referenced below)
+# Attack workflow (real datasets/models)
 neurinspectre characterize \
   --model _cli_runs/cifar10_resnet20_norm_ts.pt \
   --dataset cifar10 \
@@ -2521,7 +2506,7 @@ neurinspectre characterize \
 neurinspectre compare --mode attacks evaluation_results/summary.json
 neurinspectre compare --mode defenses evaluation_results/summary.json
 neurinspectre compare --mode runs run_a/summary.json run_b/summary.json --threshold 3.0
-neurinspectre compare --mode baseline evaluation_results/summary.json
+neurinspectre compare --mode baseline evaluation_results/summary.json --expected-asr-path /path/to/expected_asr.yaml
 neurinspectre compare --mode characterization char_results/*.json --sort-by alpha
 ```
 
@@ -2529,15 +2514,11 @@ neurinspectre compare --mode characterization char_results/*.json --sort-by alph
 <a id="attack-cli-real-output"></a>
 <a id="attack-cli-paper-aligned-real-output"></a>
 
-### 🔴 Attack CLI Usage (Paper-Aligned, Real Output)
+### 🔴 Attack CLI Usage (Real Data, No In-Repo Baselines)
 
-This section is grounded in real CLI output captured in the screenshots. It uses the exact commands and outputs shown there, so you can copy/paste and validate without relying on synthetic examples.
+This repo intentionally does not ship paper baselines or expected ASR tables. The commands below are copy/paste; the exact metrics depend on your local checkpoints, dataset versions/splits, and budgets.
 
-Paper references:
-- Section 3.1 (Characterization)
-- Section 3.2 (Attack synthesis)
-- Section 5 (Evaluation)
-- Table 1 (ASR comparisons)
+If you want strict baseline validation, supply expected values via an external YAML/JSON file (for `compare --mode baseline`, use `--expected-asr-path ...`).
 
 <a id="section-1--offensive-kill-chain"></a>
 
@@ -2572,15 +2553,14 @@ Paper references:
   │ MA-PGD    │ memory=40             │ Handles temporal dynamics           │
   ╰───────────┴───────────────────────┴─────────────────────────────────────╯
   Results saved to: char_results/jpeg.json
-  2026-02-05 22:23:13,347 - neurinspectre.cli.characterize_cmd - INFO - High-confidence characterization (88.1%) achieved. Paper Section 5.2.1: NeurInSpectre achieves 91.7% identification accuracy.
   ```
 - **Interpretation**: You see `shattered, vanishing` plus BPDA + MA-PGD recommendation.
-- **Next action**: Use adaptive attack with BPDA and MA-PGD enabled (Paper Section 3.2).
+- **Next action**: Use adaptive attack with BPDA and MA-PGD enabled.
 
 **Weapon Selection (Attack Synthesis)**
 - **You see**: `OBFUSCATION: shattered, vanishing` and `BPDA` + `MA-PGD` in the bypass table.
 - **You do**: Select `neurinspectre` adaptive attack (or BPDA/MA-PGD if running a single-method baseline).
-- **Because**: The characterization indicates both non-differentiability and temporal dynamics (Paper Section 3.2.4).
+- **Because**: The characterization indicates both non-differentiability and temporal dynamics.
 
 **Attack**
 - **Command (adaptive)**
@@ -2602,7 +2582,7 @@ Paper references:
 **Validation -> Comparison -> Reporting**
 - **You see**: Attack/defense metrics in the comparison tables (Section 3).
 - **You do**: Use `compare` to rank attacks/defenses and detect regressions.
-- **Because**: Paper Section 5 requires side-by-side ASR comparisons and reproducible deltas.
+- **Because**: Side-by-side comparisons and deltas make regressions obvious.
 
 <a id="section-2--signal-to-action-mapping-characterization"></a>
 
@@ -2630,55 +2610,13 @@ Paper cross-refs: Section 3.1 (signals), Section 3.2 (attack synthesis).
 neurinspectre compare --mode attacks evaluation_results/summary.json
 neurinspectre compare --mode defenses evaluation_results/summary.json
 neurinspectre compare --mode runs run_a/summary.json run_b/summary.json --threshold 3.0
-neurinspectre compare --mode baseline evaluation_results/summary.json
+neurinspectre compare --mode baseline evaluation_results/summary.json --expected-asr-path /path/to/expected_asr.yaml
 neurinspectre compare --mode characterization char_results/*.json --sort-by alpha
 ```
 
-**Output (real, from screenshot)**
-```text
-────────────────────── Attack Comparison (Table 1 format) ──────────────────────
-┏━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┓
-┃ Defense            ┃ neurinspe… ┃   Worst    ┃
-┡━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━┩
-│ jpeg               │  100.00%   │  100.00%   │
-└────────────────────┴────────────┴────────────┘
-────────────────────── Defense Comparison (weakest first) ──────────────────────
-        Attack: neurinspectre        
-╭──────────────────────┬────────────╮
-│ Defense              │    ASR     │
-├──────────────────────┼────────────┤
-│ jpeg                 │  100.00%   │
-╰──────────────────────┴────────────╯
-───────────────────────── Run Comparison (regression) ──────────────────────────
-┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━┓
-┃ Defense           ┃ Attack        ┃ Base ASR  ┃ Other ASR ┃  Delta   ┃  Sig  ┃
-┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━┩
-│ jpeg              │ neurinspectre │  100.00%  │  100.00%  │  +0.000  │  no   │
-└───────────────────┴───────────────┴───────────┴───────────┴──────────┴───────┘
-────────────────────── Paper Table 1 Baseline Comparison ───────────────────────
-┏━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┓
-┃ Defense            ┃ Attack         ┃  Baseline  ┃  Observed  ┃   Delta    ┃
-┡━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━┩
-│ jpeg               │ neurinspectre  │   98.20%   │  100.00%   │   +0.018   │
-└────────────────────┴────────────────┴────────────┴────────────┴────────────┘
-────────────────────── Characterization Signal Comparison ──────────────────────
-┏━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━┳━━━━━┳━━━━━━━┳━━━━━━┳━━━━━━━┓
-┃ Defense       ┃ Obfuscation       ┃ Conf… ┃ ETD ┃ Al… ┃ Vari… ┃ Jac… ┃ Time… ┃
-┡━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━╇━━━━━╇━━━━━━━╇━━━━━━╇━━━━━━━┩
-│ jpeg          │ shattered,        │ 88.1… │ 0.… │ 20… │ 0.00% │ 0.0… │ 50.0… │
-│               │ vanishing         │       │     │     │       │      │       │
-└───────────────┴───────────────────┴───────┴─────┴─────┴───────┴──────┴───────┘
-```
-
-<details>
-<summary><b>Click to see: Real CLI output screenshot (characterize + compare)</b></summary>
-
-<p align="center">
-  <img src="docs/examples/attack_compare_real_output.png" alt="NeurInSpectre CLI real output - characterize + compare tables" width="100%"/>
-</p>
-</details>
-
-Paper cross-refs: Section 5, Table 1, Section 5.2.2.
+**Output**
+NeurInSpectre prints tables to the terminal and can export JSON/SARIF for machine consumption.
+Baseline comparisons require an external expected-ASR file (not stored in-repo).
 
 <a id="section-4--signal-to-action-mapping-evaluation-regression"></a>
 
@@ -2686,19 +2624,17 @@ Paper cross-refs: Section 5, Table 1, Section 5.2.2.
 
 | Output key / mode | Threshold | Interpretation | Action |
 |---|---|---|---|
-| `attack_success_rate` (compare: attacks/defenses) | >= 0.70 | Critical vulnerability | Prioritize defense changes, rerun adaptive + AutoAttack |
-| `delta` (compare: runs) | >= `--threshold` (pp) | Regression vs prior run | Flag CI/CD, investigate config/model drift |
-| `delta` (compare: baseline) | >= 2.0pp | Divergence from Table 1 | Re-check config + dataset parity |
-
-Paper cross-refs: Section 5, Table 1, Section 5.3.
+| `attack_success_rate` (compare: attacks/defenses) | high | Critical vulnerability | Prioritize defense changes, rerun adaptive + baseline attacks |
+| `delta` (compare: runs) | >= `--threshold` | Regression vs prior run | Flag CI/CD, investigate config/model drift |
+| `delta` (compare: baseline) | outside tolerance | Divergence vs expected baseline file | Re-check config + dataset parity |
 
 <a id="section-5--woot-aec-compliance"></a>
 
 #### Section 5 - WOOT AEC Compliance (Reproducibility and Reuse)
 
-**Consistency with paper**  
-- `characterize` outputs Section 3.1 signals (ETD, alpha, variance, rank, timescale).  
-- `compare --mode baseline` mirrors Table 1 deltas (Section 5.2.2).
+**Baseline policy**  
+- This repo intentionally does not ship paper baselines or expected ASR numbers.  
+- For validation, supply expected values via external files (`--expected-asr-path`, `baseline_validation.expected_asr_path`).
 
 **Completeness**  
 - `evaluate` produces `evaluation_results/summary.json` (full defense x attack matrix).  
@@ -4016,7 +3952,7 @@ img_arr[213:223, 182:192] = 0  # 10×10 black square
 Image.fromarray(img_arr).save('_cli_runs/adversarial.jpg')
 ```
 
-**Expected**: 70-85% misclassification success  
+**Expected**: model- and dataset-dependent misclassification success (validate locally)  
 **Research**: ICLR 2024, CVPR 2024 - Occlusion attacks on Vision Transformers
 
 **STEP 2: Physical-World Attack**
@@ -4031,7 +3967,7 @@ Image.fromarray(img_arr).save('_cli_runs/adversarial.jpg')
 **STEP 3: Multi-Region Attack**
 
 **Combine Top 5 High-Risk Zones**:
-- Cumulative impact: 5 × 10% = 50%+ model disruption
+- Cumulative impact can grow as you occlude multiple high-risk zones
   - Effectiveness varies by model/dataset; validate locally.
 
 **Tool**: `neurinspectre occlusion-analysis` identifies all zones, exploit top 5
@@ -4984,7 +4920,7 @@ neurinspectre --help  # Should display CLI commands
   - Enhanced gradient verification protocols
 
 - **Building Gradient Bridges (Dec 2024)**: [arXiv:2412.12640](https://arxiv.org/abs/2412.12640)
-  - >80% label recovery from restricted gradient sharing (paper result; validate locally)
+  - Label recovery from restricted gradient sharing (validate locally)
   - Comprehensive gradient magnitude / leakage triage analysis
   - Differential privacy countermeasures
 
@@ -5000,7 +4936,7 @@ neurinspectre --help  # Should display CLI commands
 ### Research Integration Features
 - **Real-time Research Updates**: Latest findings integrated within weeks
 - **Validation Framework**: Tools/workflows to validate research claims against your datasets
-- **Datasets**: bring your own activation/gradient artifacts; NeurInSpectre includes small examples and generators for synthetic test data
+- **Datasets**: bring your own activation/gradient artifacts; NeurInSpectre includes small example artifacts for format/sanity checks (not for paper results)
 - **MITRE ATLAS Mapping**: Standardized technique taxonomy integration
 
 <a id="operational-use-cases"></a>
@@ -6298,10 +6234,12 @@ neurinspectre prompt_injection_analysis \
   --head 3 \
   --out-prefix _cli_runs/pia_
 
-open _cli_runs/pia_pia_interactive.html**Research Foundation** (2024):
+open _cli_runs/pia_pia_interactive.html
+
+**Research Foundation** (2024):
 - Attention Tracker (arxiv 2411.00348) - Distraction effect detection
-- UTDMF Framework - 92% prompt injection detection accuracy
-- AEGIS Co-evolutionary Defense - 0.84 true positive rate
+- UTDMF Framework - prompt injection detection accuracy (validate locally)
+- AEGIS Co-evolutionary Defense - true positive rate (validate locally)
 
 **🔴 Red Team - Attack Vectors**:
 | Visual Element | Attack Significance | Exploitation Strategy |
@@ -6422,7 +6360,7 @@ open _cli_runs/evasion_summary.html
 - **Panel 3**:  Red Team Intelligence (14+ actionable rows)
 - **Panel 4**:  Blue Team Defense (14+ actionable rows with 6-step workflow)
 
-**Transport Dynamics (84.9% confidence in tests)**:
+**Transport Dynamics (confidence shown in dashboard)**:
 - **Definition**: Multi-hop routing + timing randomization + protocol obfuscation
 - **Red Team**: 5-step evasion enhancement (protocol encryption, multi-hop, timing jitter)
 - **Blue Team**: 6-step defense (network isolation, DPI, timing analysis, fingerprinting)
@@ -7514,9 +7452,9 @@ neurinspectre occlusion-analysis \
 | Step | Action | Expected Result |
 |------|--------|-----------------|
 | 1 | Identify red/yellow zones | Find top-5 highest-impact regions |
-| 2 | Place adversarial patch at peak | 70-85% misclassification success |
+| 2 | Place adversarial patch at peak | model/dataset-dependent misclassification success (validate locally) |
 | 3 | Physical-world attack | Print patch, apply to object → variable success |
-| 4 | Multi-region attack | Combine top-5 zones → 90-95% model disruption |
+| 4 | Multi-region attack | compound disruption can increase with multiple zones (validate locally) |
 
 **Attack Code**:
 ```python
@@ -7885,8 +7823,8 @@ The **Layer-Level Causal Impact** visualization identifies which layers of a neu
 This implementation is grounded in recent offensive AI security research (2024-2025):
 
 1. **SoK: Comprehensive Causality Analysis Framework for LLM Security** (Dec 2025, arXiv:2512.04841)
-   - Safety-related mechanisms are highly localized (1-2% of neurons)
-   - Layer-level interventions achieve 95%+ detection accuracy
+   - Safety-related mechanisms can be highly localized (validate locally)
+   - Layer-level interventions can yield strong detection signals (validate locally)
    - Early-to-middle layers are primary attack vectors
 
 
@@ -7960,10 +7898,10 @@ When you see hot layers like layer 11 in the visualization, it means:
    - Middle layers (5-8): Use syntactic patterns and structure
    - Late layers (9-11): Avoid — these are heavily monitored for output manipulation
 
-#### **Success Metrics**
-- **Stealth Score:** 100% of layers below 90th percentile ✓
-- **Attack Success Rate (ASR):** ≥85% trigger activation ✓
-- **Detection Evasion:** 0 layers above 95th percentile ✓
+#### **Success Metrics (Example Targets)**
+- **Stealth Score:** layers below your configured percentile threshold (calibrate)
+- **Attack Success Rate (ASR):** meets your operational success threshold (calibrate)
+- **Detection Evasion:** no hot layers above your alert threshold (calibrate)
 
 ---
 
@@ -8124,9 +8062,9 @@ done
 - **High KL divergence** = activations have shifted dramatically
 
 **Why 95th Percentile?**
-- Research shows **1-2% of neurons** exhibit causal influence (SoK: Causality Analysis, Dec 2025)
+- Research suggests a small fraction of neurons can exhibit outsized causal influence (validate locally)
 - 95th percentile captures the top 5% most anomalous layers
-- Aligns with empirical detection accuracy (>95% TPR in HAct paper, 2024)
+- Treat percentile thresholds as tunable; validate with held-out benign/attack prompt suites
 
 **Alternative Methods:**
 - **JS Divergence:** Symmetric, bounded [0,1], less sensitive to outliers
@@ -8195,12 +8133,12 @@ Threshold: ≥95.0th percentile (research: 1-2% of neurons causally relevant)
 
 
 2. **Backdoor Attribution: Elucidating and Controlling Backdoor in LLMs** (Sep 2025, arXiv:2509.21761)
-   - Ablating ~3% of attention heads reduces Attack Success Rate (ASR) by 90%
+   - Ablating a small fraction of attention heads can materially reduce ASR (validate locally)
    - Backdoor features are processed in specific layers
    - Layer-specific interventions provide master control
 
 3. **HAct: Activation Clustering for Attack Detection** (2024, arXiv:2309.04837)
-   - 95% true positive rate with 0.03% false positive
+   - High true positive rate at low false positive rate (validate locally)
    - Activation histogram analysis reliably detects OOD inputs
    - Layer-level activation monitoring enables real-time detection
 
@@ -8569,18 +8507,18 @@ python plot_cumulative_sensitivity.py _sensitivity/layer_*.json
 
 Based on **SoK: Comprehensive Causality Analysis Framework** (Dec 2025):
 
-- **1-2% of neurons** exhibit causal influence → 95th percentile captures this
+- A small fraction of neurons exhibit causal influence → high-percentile thresholds can isolate them
 - **Early-to-middle layers** (layers 0-6 in 12-layer model) host safety mechanisms
-- **Layer-level interventions** achieve **95%+ detection accuracy**
-- **Ablating ~3% of attention heads** (from hot layers) reduces ASR by 90%
+- Layer-level interventions can provide strong detection signals (validate locally)
+- Ablating a small fraction of attention heads (from hot layers) can materially reduce ASR (validate locally)
 
 **Calibration Procedure:**
 
 1. Collect 1000 benign prompts representative of normal usage
 2. Compute mean and std of KL divergence for each layer
-3. Set threshold at mean + 2×std (corresponds to ~95th percentile if normally distributed)
-4. Validate on held-out benign set (target: <1% false positive rate)
-5. Test on known attack prompts (target: >90% detection rate)
+3. Set threshold at mean + 2×std (roughly a high percentile if normally distributed)
+4. Validate on held-out benign set (target: low false positive rate)
+5. Test on known attack prompts (target: high detection rate)
 
 ---
 

@@ -1,0 +1,328 @@
+# table2_config.yaml
+#
+# High-level configuration to run the Table 2-style pipeline.
+# This is a *specification* consumed by the Click CLI (`neurinspectre table2`).
+
+table_id: 2
+description: >
+  Attack success rate (ASR) of PGD, AutoAttack, and NeurInSpectre against
+  12 defenses across 4 datasets (Content Moderation, Malware Detection,
+  Autonomous Vehicle Perception), at epsilon=8/255 (L_inf) or dataset-specific
+  budgets. Paper baselines/expected values are intentionally not stored in-repo;
+  provide them externally if you want strict baseline validation.
+
+# Global defaults and knobs
+defaults:
+  attack_budgets:
+    # L_inf budgets (normalized to [0,1] as usual)
+    cifar10:
+      norm: linf
+      eps: 0.03137254901960784      # 8/255
+    imagenet100:
+      norm: linf
+      eps: 0.03137254901960784      # 8/255
+    mnist:
+      norm: linf
+      eps: 0.3
+    ember:
+      norm: l2
+      eps: 0.5
+    nuscenes:
+      norm: l2
+      eps: 3.0
+
+  # Iterations and steps for gradient-based attacks
+  pgd:
+    steps: 50
+    step_size: 0.00784313725490196  # 2/255
+    random_start: true
+  apgd:
+    steps: 100
+    targeted_fraction: 0.0          # untargeted only for Table 2
+  square:
+    max_queries: 10000
+
+  # Evaluation options
+  evaluation:
+    batch_size: 128
+    num_workers: 0                  # safer for macOS + memmap
+    shuffle_eval: false
+    cache_dir: "cache/table2"
+    metrics:
+      - asr
+      - robust_accuracy
+
+  # General model loading defaults
+  model_defaults:
+    device: "auto"                  # "cuda", "mps", or "cpu"
+    dtype: "float32"
+
+# Datasets used in Table 2
+datasets:
+  content_moderation:
+    name: "content_moderation"
+    backing_dataset: "cifar10"      # CIFAR-10 proxy for content moderation
+    split: "test"
+    num_classes: 10
+    data_module: "neurinspectre.data.datasets"
+    loader_fn: "get_content_moderation_dataset"
+
+  malware_detection:
+    name: "malware_detection"
+    backing_dataset: "ember"
+    split: "test"
+    num_classes: 2
+    data_module: "neurinspectre.data.datasets"
+    loader_fn: "get_ember_dataset"
+    notes: >
+      Requires correctly vectorized EMBER2018 (X_train.dat/X_test.dat with
+      aligned labels); see forthcoming scripts/vectorize_ember_safe.py.
+
+  av_perception:
+    name: "av_perception"
+    backing_dataset: "nuscenes"
+    split: "val"
+    num_classes: 10
+    data_module: "neurinspectre.data.datasets"
+    loader_fn: "get_nuscenes_perception_dataset"
+
+# Attack configurations used in Table 2
+attacks:
+  pgd:
+    id: "pgd"
+    module: "neurinspectre.attacks.pgd"
+    class_name: "PGDAttack"
+    uses_autoattack: false
+    config_key: "pgd"           # resolve from defaults.pgd
+  autoattack:
+    id: "autoattack"
+    module: "neurinspectre.attacks.autoattack"
+    class_name: "AutoAttackWrapper"
+    uses_autoattack: true
+    config_key: "apgd"          # resolve from defaults.apgd
+  neurinspectre:
+    id: "neurinspectre"
+    module: "neurinspectre.attacks.hybrid"
+    class_name: "NeurInspectreAdaptiveAttack"
+    uses_autoattack: false
+    config_key: "adaptive"
+    notes: >
+      Orchestrates BPDA/EOT/memory-augmented gradients according to
+      neurinspectre.characterization.defense_analyzer output.
+
+# Defense registry for Table 2
+#
+# Each entry defines:
+# - which dataset group it belongs to
+# - the underlying model (factory key, architecture)
+# - defense type (used by defense_analyzer and attack synthesizer)
+# - wrapper module/class for forward pass
+# - optional metadata like "claimed_robust_accuracy" (keep out of repo; supply externally)
+#
+defenses:
+  # --------------------------
+  # Content Moderation (4)
+  # --------------------------
+  - id: "cm_jpeg_compression"
+    domain: "content_moderation"
+    dataset: "content_moderation"
+    model:
+      factory_key: "cifar10_resnet_cm_jpeg"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "cm_jpeg_cifar10"
+    defense:
+      type: "jpeg_compression"
+      module: "neurinspectre.defenses.jpeg_compression"
+      class_name: "JPEGCompressionDefense"
+      params:
+        quality: 75
+    group: "content_moderation"
+
+  - id: "cm_bit_depth_reduction"
+    domain: "content_moderation"
+    dataset: "content_moderation"
+    model:
+      factory_key: "cifar10_resnet_cm_bitdepth"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "cm_bitdepth_cifar10"
+    defense:
+      type: "bit_depth_reduction"
+      module: "neurinspectre.defenses.preprocessing_wrappers"
+      class_name: "BitDepthReductionDefense"
+      params:
+        bits: 4
+    group: "content_moderation"
+
+  - id: "cm_random_smoothing"
+    domain: "content_moderation"
+    dataset: "content_moderation"
+    model:
+      factory_key: "cifar10_resnet_cm_smoothing"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "cm_smoothing_cifar10"
+    defense:
+      type: "randomized_smoothing"
+      module: "neurinspectre.defenses.randomized_smoothing"
+      class_name: "RandomizedSmoothingDefense"
+      params:
+        sigma: 0.25
+        num_samples: 16
+    group: "content_moderation"
+
+  - id: "cm_ensemble_diversity"
+    domain: "content_moderation"
+    dataset: "content_moderation"
+    model:
+      factory_key: "cifar10_resnet_cm_ensemble"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_ensemble"
+      checkpoint_tag: "cm_ensemble_cifar10"
+    defense:
+      type: "ensemble_diversity"
+      module: "neurinspectre.defenses.other"
+      class_name: "EnsembleDiversityDefense"
+      params:
+        ensemble_size: 5
+        voting: "majority"
+    group: "content_moderation"
+
+  # --------------------------
+  # Malware Detection (4)
+  # --------------------------
+  - id: "md_feature_squeezing"
+    domain: "malware_detection"
+    dataset: "malware_detection"
+    model:
+      factory_key: "ember_mlp_feature_squeeze"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "md_feature_squeezing_ember"
+    defense:
+      type: "feature_squeezing"
+      module: "neurinspectre.defenses.other"
+      class_name: "FeatureSqueezingDefense"
+      params:
+        bit_depth: 4
+        sparsify_threshold: 0.01
+    group: "malware_detection"
+
+  - id: "md_gradient_regularization"
+    domain: "malware_detection"
+    dataset: "malware_detection"
+    model:
+      factory_key: "ember_mlp_grad_reg"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "md_gradient_reg_ember"
+    defense:
+      type: "gradient_regularization"
+      module: "neurinspectre.defenses.other"
+      class_name: "GradientRegularizationDefense"
+      params:
+        lambda_reg: 1e-3
+    group: "malware_detection"
+
+  - id: "md_defensive_distillation"
+    domain: "malware_detection"
+    dataset: "malware_detection"
+    model:
+      factory_key: "ember_mlp_distilled"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "md_distillation_ember"
+    defense:
+      type: "defensive_distillation"
+      module: "neurinspectre.defenses.other"
+      class_name: "DefensiveDistillationDefense"
+      params:
+        temperature: 20.0
+    group: "malware_detection"
+
+  - id: "md_at_transform"
+    domain: "malware_detection"
+    dataset: "malware_detection"
+    model:
+      factory_key: "ember_mlp_at_transform"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "md_at_transform_ember"
+    defense:
+      type: "adversarial_training_transform"
+      module: "neurinspectre.defenses.adversarial_training"
+      class_name: "AdversarialTrainingWithTransformsDefense"
+      params:
+        transform: "feature_masking"
+        epsilon: 0.5
+    group: "malware_detection"
+
+  # --------------------------
+  # AV Perception (4)
+  # --------------------------
+  - id: "av_spatial_smoothing"
+    domain: "av_perception"
+    dataset: "av_perception"
+    model:
+      factory_key: "nuscenes_resnet_spatial_smoothing"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "av_spatial_smoothing_nuscenes"
+    defense:
+      type: "spatial_smoothing"
+      module: "neurinspectre.defenses.preprocessing_wrappers"
+      class_name: "SpatialSmoothingDefense"
+      params:
+        kernel_size: 5
+    group: "av_perception"
+
+  - id: "av_random_pad_crop"
+    domain: "av_perception"
+    dataset: "av_perception"
+    model:
+      factory_key: "nuscenes_resnet_padcrop"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "av_random_padcrop_nuscenes"
+    defense:
+      type: "random_pad_crop"
+      module: "neurinspectre.defenses.input_transformations"
+      class_name: "RandomPadAndCropDefense"
+      params:
+        padding: 4
+    group: "av_perception"
+
+  - id: "av_thermometer_encoding"
+    domain: "av_perception"
+    dataset: "av_perception"
+    model:
+      factory_key: "nuscenes_resnet_thermometer"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "av_thermometer_nuscenes"
+    defense:
+      type: "thermometer_encoding"
+      module: "neurinspectre.defenses.thermometer_encoding"
+      class_name: "ThermometerEncodingDefense"
+      params:
+        levels: 10
+    group: "av_perception"
+
+  - id: "av_certified_defense"
+    domain: "av_perception"
+    dataset: "av_perception"
+    model:
+      factory_key: "nuscenes_resnet_certified"
+      module: "neurinspectre.models.factory"
+      loader_fn: "load_model"
+      checkpoint_tag: "av_certified_nuscenes"
+    defense:
+      type: "certified_randomized_smoothing"
+      module: "neurinspectre.defenses.randomized_smoothing"
+      class_name: "CertifiedRandomizedSmoothingDefense"
+      params:
+        sigma: 0.25
+        certification_radius: 0.5
+    group: "av_perception"
+

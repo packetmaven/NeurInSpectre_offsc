@@ -4,6 +4,7 @@ DefenseFactory for creating defended models.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
@@ -89,22 +90,30 @@ class DefenseFactory:
 
 
 def _ensemble_diversity_defense(base_model: nn.Module, params: Dict[str, Any], device: str) -> nn.Module:
-    from ..models.factory import ModelFactory
-
     members_cfg = params.get("members")
     if not members_cfg:
         raise ValueError("ensemble_diversity requires 'members' list in params")
 
     models: List[nn.Module] = []
     for member in members_cfg:
-        member_kwargs = {k: v for k, v in member.items() if k not in {"domain", "model_name", "training_type", "device"}}
-        model = ModelFactory.load_model(
-            domain=member["domain"],
-            model_name=member["model_name"],
-            training_type=member.get("training_type", "standard"),
-            device=member.get("device", device),
-            **member_kwargs,
-        )
+        path = member.get("path") or member.get("checkpoint_path") or member.get("weights_path")
+        if path:
+            model = _load_model_from_path(Path(path), device=member.get("device", device))
+        else:
+            from ..models.factory import ModelFactory
+
+            member_kwargs = {
+                k: v
+                for k, v in member.items()
+                if k not in {"domain", "model_name", "training_type", "device"}
+            }
+            model = ModelFactory.load_model(
+                domain=member["domain"],
+                model_name=member["model_name"],
+                training_type=member.get("training_type", "standard"),
+                device=member.get("device", device),
+                **member_kwargs,
+            )
         models.append(model)
 
     aggregation = params.get("aggregation", params.get("voting", "average"))
@@ -118,3 +127,30 @@ def _infer_device(model: nn.Module, params: Dict[str, Any]) -> str:
         return str(next(model.parameters()).device)
     except StopIteration:
         return "cpu"
+
+
+def _load_model_from_path(path: Path, device: str) -> nn.Module:
+    if not path.exists():
+        raise FileNotFoundError(f"Model file not found: {path}")
+
+    try:
+        model = torch.jit.load(str(path), map_location=device)
+        model.eval()
+        return model
+    except Exception:
+        pass
+
+    obj = torch.load(path, map_location=device)
+    if isinstance(obj, nn.Module):
+        model = obj.to(device)
+        model.eval()
+        return model
+    if isinstance(obj, dict) and isinstance(obj.get("model"), nn.Module):
+        model = obj["model"].to(device)
+        model.eval()
+        return model
+
+    raise ValueError(
+        "Unsupported checkpoint format for ensemble member. "
+        "Provide a TorchScript model or a serialized nn.Module."
+    )

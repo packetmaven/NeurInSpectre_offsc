@@ -1,0 +1,6 @@
+{
+  "is_stub": true,
+  "dataset": "imagenet100",
+  "reason": "Placeholder artifact (not a trained ImageNet-100 classifier)."
+}
+

@@ -50,9 +50,19 @@ def test_bpda_thermometer_approx():
     x = torch.rand(5, 3, 32, 32).requires_grad_(True)
     x_approx = bpda_thermometer(x, levels=16)
 
+    assert x_approx.shape == x.shape
     unique_vals = torch.unique(x_approx.detach())
     assert len(unique_vals) <= 17
+    assert float(x_approx.min().item()) >= 0.0
+    assert float(x_approx.max().item()) <= 1.0
     assert x_approx.requires_grad
+
+
+def test_bpda_thermometer_bits_expands_channels():
+    x = torch.rand(2, 3, 8, 8).requires_grad_(True)
+    x_bits = BPDA_REGISTRY["thermometer_bits"](x, levels=10)
+    assert x_bits.shape == (2, 3 * 10, 8, 8)
+    assert x_bits.requires_grad is True
 
 
 def test_learned_bpda_training():

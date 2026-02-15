@@ -1,0 +1,7 @@
+{
+  "dataset": "cifar10",
+  "architecture": "resnet20",
+  "format": "torchscript",
+  "notes": "Small trained CIFAR-10 model intended for strict real-data smoke runs."
+}
+

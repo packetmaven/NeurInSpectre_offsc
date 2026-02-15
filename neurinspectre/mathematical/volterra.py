@@ -181,6 +181,9 @@ def fit_volterra_kernel(
     kernel_type: str = "power_law",
     method: str = "L-BFGS-B",
     verbose: bool = False,
+    *,
+    dt: float = 1.0,
+    discretization: str = "trapezoid",
 ) -> Tuple[VolterraKernel, float, dict]:
     """
     Fit Volterra kernel parameters to observed gradient sequence.
@@ -190,6 +193,11 @@ def fit_volterra_kernel(
         kernel_type: Type of kernel ('power_law', 'exponential', 'uniform')
         method: Optimization method ('L-BFGS-B' or 'differential_evolution')
         verbose: Print optimization progress
+        dt: Time step between samples (default 1.0)
+        discretization:
+            - "picard": left-sum Picard approximation using observed history on RHS
+            - "trapezoid": trapezoid-rule Picard approximation (observed RHS; default)
+            - "sequential"/"solve": trapezoid-rule sequential solve using predicted history
 
     Returns:
         (fitted_kernel, rmse, info)
@@ -213,7 +221,11 @@ def fit_volterra_kernel(
     else:
         raise ValueError(f"Unknown kernel type: {kernel_type}")
 
-    times = np.arange(t_steps, dtype=np.float64)
+    dt = float(dt)
+    if dt <= 0:
+        raise ValueError("dt must be > 0.")
+    times = np.arange(t_steps, dtype=np.float64) * dt
+    disc = str(discretization).lower().strip().replace("-", "_")
 
     def objective(params: np.ndarray) -> float:
         if kernel_type == "power_law":
@@ -227,13 +239,61 @@ def fit_volterra_kernel(
         else:
             raise ValueError(f"Unknown kernel type: {kernel_type}")
 
-        k_mat = kernel.evaluate(times, times)
-        g_recon = k_mat @ grad
-        error = grad - g_recon
+        try:
+            k_mat = np.asarray(kernel.evaluate(times, times), dtype=np.float64)
+            y0 = grad[0, :].astype(np.float64, copy=False)  # (D,)
+
+            if disc in {"picard", "one_step", "picard1"}:
+                # Picard-style approximation (uses observed RHS):
+                #   y(t_i) ≈ y0 + Σ_j K(t_i, t_j) y_obs(t_j) Δt
+                g_pred = y0[None, :] + dt * (k_mat @ grad)
+            elif disc in {"trapezoid", "trapezoidal"}:
+                # Trapezoid-rule discretization (Picard-style; uses observed RHS):
+                #   y(t_i) ≈ y0 + ∫_0^{t_i} K(t_i, s) y_obs(s) ds
+                #        ≈ y0 + dt * Σ_{j=0}^{i-1} 0.5 * ( K(i,j) y_obs[j] + K(i,j+1) y_obs[j+1] )
+                g_pred = np.zeros_like(grad, dtype=np.float64)
+                g_pred[0, :] = y0
+                for i in range(1, t_steps):
+                    k_row = k_mat[i, :i]  # (i,)
+                    term1 = k_row @ grad[:i, :]  # (D,)
+                    if i >= 2:
+                        term2 = k_row[1:] @ grad[1:i, :]  # (D,)
+                    else:
+                        term2 = 0.0
+                    g_pred[i, :] = y0 + 0.5 * dt * (term1 + term2)
+
+                    if (not np.isfinite(g_pred[i, :]).all()) or np.max(np.abs(g_pred[i, :])) > 1e12:
+                        return 1e9
+            elif disc in {"sequential", "solve", "trapezoid_solve"}:
+                # Trapezoid-rule discretization of the Volterra 2nd-kind equation,
+                # solved sequentially with the causal convention K(t_i, t_i)=0.
+                g_pred = np.zeros_like(grad, dtype=np.float64)
+                g_pred[0, :] = y0
+                for i in range(1, t_steps):
+                    k_row = k_mat[i, :i]  # (i,)
+                    term1 = k_row @ g_pred[:i, :]  # (D,)
+                    if i >= 2:
+                        term2 = k_row[1:] @ g_pred[1:i, :]  # (D,)
+                    else:
+                        term2 = 0.0
+                    g_pred[i, :] = y0 + 0.5 * dt * (term1 + term2)
+
+                    if (not np.isfinite(g_pred[i, :]).all()) or np.max(np.abs(g_pred[i, :])) > 1e12:
+                        return 1e9
+            else:
+                raise ValueError(f"Unknown discretization: {discretization!r}")
+        except Exception:
+            return 1e9
+
+        if not np.isfinite(g_pred).all():
+            return 1e9
+        error = grad - g_pred
         return float(np.sqrt((error ** 2).mean()))
 
     if kernel_type == "power_law":
-        bounds = [(0.1, 0.99), (0.1, 10.0)]
+        # Allow near-zero kernel strength (clean gradients) without forcing alpha
+        # to the optimizer boundary just to suppress the convolution term.
+        bounds = [(0.1, 0.99), (1e-6, 10.0)]
         x0 = np.array([0.5, 1.0], dtype=np.float64)
     elif kernel_type == "exponential":
         bounds = [(0.01, 10.0)]
@@ -257,6 +317,8 @@ def fit_volterra_kernel(
             "success": bool(result.success),
             "nit": int(result.nit),
             "message": str(result.message),
+            "dt": float(dt),
+            "discretization": str(discretization),
         }
     elif method == "differential_evolution":
         result = differential_evolution(
@@ -272,6 +334,8 @@ def fit_volterra_kernel(
             "success": bool(result.success),
             "nit": int(result.nit),
             "message": str(result.message),
+            "dt": float(dt),
+            "discretization": str(discretization),
         }
     else:
         raise ValueError(f"Unknown optimization method: {method}")

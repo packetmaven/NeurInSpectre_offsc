@@ -195,8 +195,10 @@ class EMBERDataset:
         subset = "train" if str(split).lower() in {"train", "training"} else "test"
         x_test, y_test = ember.read_vectorized_features(data_dir, subset=subset)
 
-        x_test = torch.from_numpy(x_test).float()
-        y_test = torch.from_numpy(y_test).long()
+        # ``ember.read_vectorized_features`` can return read-only memmap-backed
+        # arrays; copy to writable buffers before converting to tensors.
+        x_test = torch.from_numpy(np.array(x_test, copy=True)).float()
+        y_test = torch.from_numpy(np.array(y_test, copy=True)).long()
 
         labeled_mask = y_test >= 0
         x_test = x_test[labeled_mask]
@@ -222,6 +224,24 @@ class EMBERDataset:
         return loader, x_test, y_test
 
 
+class NuScenesImageDataset(Dataset):
+    """Pickle-safe dataset for nuScenes images."""
+
+    def __init__(self, items: List[Dict], transform):
+        self.items = items
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        item = self.items[idx]
+        img = Image.open(item["image_path"]).convert("RGB")
+        x = self.transform(img)
+        y = int(item["label"])
+        return x, y
+
+
 class nuScenesDataset:
     """nuScenes perception dataset for AV domain."""
 
@@ -236,6 +256,7 @@ class nuScenesDataset:
         batch_size: int = 16,
         num_workers: int = 2,
         pin_memory: bool = True,
+        split: str = "val",
     ) -> Tuple[DataLoader, torch.Tensor, torch.Tensor]:
         if not os.path.exists(root):
             raise FileNotFoundError(
@@ -262,12 +283,49 @@ class nuScenesDataset:
         camera_channel = "CAM_FRONT"
         samples: List[Dict] = []
 
-        for scene in nusc.scene:
+        # Respect nuScenes official scene splits (mini_train/mini_val for v1.0-mini,
+        # train/val/test otherwise). This avoids mixing train/val and makes the
+        # "split" knob in YAML configs meaningful.
+        split_norm = str(split).lower()
+        is_mini = "mini" in str(version).lower()
+        scene_names = None
+        if split_norm not in {"all", "any", "full", ""}:
+            # nuScenes v1.0-mini provides mini_train/mini_val only. For CLI
+            # ergonomics, treat "test" as an alias of "val".
+            if is_mini and split_norm in {"test", "testing"}:
+                split_norm = "val"
+            try:
+                from nuscenes.utils.splits import create_splits_scenes
+
+                splits = create_splits_scenes()
+                if split_norm in {"train", "training"}:
+                    key = "mini_train" if is_mini else "train"
+                elif split_norm in {"val", "valid", "validation"}:
+                    key = "mini_val" if is_mini else "val"
+                elif split_norm in {"test", "testing"}:
+                    key = "test"
+                else:
+                    key = None
+                if key and key in splits:
+                    scene_names = set(splits[key])
+            except Exception:
+                scene_names = None
+
+        scenes = list(nusc.scene)
+        if scene_names is not None:
+            scenes = [s for s in scenes if s.get("name") in scene_names]
+        if not scenes:
+            raise ValueError(f"nuScenes split produced 0 scenes (split={split}, version={version})")
+
+        for scene in scenes:
             sample_token = scene["first_sample_token"]
             while sample_token:
                 sample = nusc.get("sample", sample_token)
                 camera_data = nusc.get("sample_data", sample["data"][camera_channel])
                 img_path = os.path.join(root, camera_data["filename"])
+                if not os.path.exists(img_path):
+                    sample_token = sample["next"]
+                    continue
                 if sample_token in label_map:
                     samples.append(
                         {
@@ -296,22 +354,7 @@ class nuScenesDataset:
                 transforms.ToTensor(),
             ]
         )
-
-        class NuScenesImageDataset(Dataset):
-            def __init__(self, items):
-                self.items = items
-
-            def __len__(self):
-                return len(self.items)
-
-            def __getitem__(self, idx):
-                item = self.items[idx]
-                img = Image.open(item["image_path"]).convert("RGB")
-                x = transform(img)
-                y = int(item["label"])
-                return x, y
-
-        dataset = NuScenesImageDataset(samples)
+        dataset = NuScenesImageDataset(samples, transform)
         loader = DataLoader(
             dataset,
             batch_size=batch_size,

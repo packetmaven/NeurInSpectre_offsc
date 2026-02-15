@@ -133,7 +133,6 @@ class JPEGCompressionDefense(DefenseWrapper):
             params={"quality": int(quality)},
             requires_bpda=True,
             bpda_approximation="jpeg",
-            claimed_robust_accuracy=0.89,
         )
         super().__init__(base_model, spec, device)
         self.defense = JPEGCompression(quality=quality, differentiable=False)
@@ -154,7 +153,6 @@ class BitDepthReductionDefense(DefenseWrapper):
             params={"bits": int(bits)},
             requires_bpda=True,
             bpda_approximation="identity",
-            claimed_robust_accuracy=0.91,
         )
         super().__init__(base_model, spec, device)
         self.defense = BitDepthReduction(bits=bits, differentiable=False)
@@ -175,13 +173,20 @@ class ThermometerEncodingDefense(DefenseWrapper):
             params={"levels": int(levels)},
             requires_bpda=True,
             bpda_approximation="soft_thermometer",
-            claimed_robust_accuracy=0.95,
         )
         self.levels = int(levels)
+        self._use_channel_adapter = False
         super().__init__(base_model, spec, device)
         self._adapt_model_input()
 
     def _adapt_model_input(self) -> None:
+        if isinstance(self.base_model, (torch.jit.ScriptModule, torch.jit.RecursiveScriptModule)):
+            self._use_channel_adapter = True
+            logger.warning(
+                "ThermometerEncodingDefense: TorchScript model detected; "
+                "using channel-reduction fallback instead of mutating conv1."
+            )
+            return
         if hasattr(self.base_model, "conv1"):
             conv1 = self.base_model.conv1
             out_channels = conv1.out_channels
@@ -200,7 +205,21 @@ class ThermometerEncodingDefense(DefenseWrapper):
                 original_weight = conv1.weight.data
                 new_weight = original_weight.repeat(1, self.levels, 1, 1) / self.levels
                 new_conv1.weight.data = new_weight
-            self.base_model.conv1 = new_conv1
+            try:
+                self.base_model.conv1 = new_conv1
+            except Exception as exc:
+                self._use_channel_adapter = True
+                logger.warning(
+                    "ThermometerEncodingDefense: unable to replace conv1 (%s); "
+                    "using channel-reduction fallback.",
+                    exc,
+                )
+        else:
+            self._use_channel_adapter = True
+            logger.warning(
+                "ThermometerEncodingDefense: base model missing conv1; "
+                "using channel-reduction fallback."
+            )
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
@@ -208,7 +227,10 @@ class ThermometerEncodingDefense(DefenseWrapper):
         thresholds = thresholds.view(1, 1, -1, 1, 1)
         x_expanded = x.unsqueeze(2)
         thermometer = (x_expanded > thresholds).float()
-        return thermometer.view(b, c * self.levels, h, w)
+        encoded = thermometer.view(b, c * self.levels, h, w)
+        if self._use_channel_adapter:
+            return encoded.view(b, c, self.levels, h, w).mean(dim=2)
+        return encoded
 
     def get_bpda_approximation(self) -> Callable[[torch.Tensor], torch.Tensor]:
         levels = self.levels
@@ -227,7 +249,22 @@ class ThermometerEncodingDefense(DefenseWrapper):
                 soft = torch.sigmoid((x_expanded - thresholds) * self.tau)
                 return soft.view(b, c * self.levels, h, w)
 
-        return SoftThermometer(levels=levels).to(self.device)
+        approx = SoftThermometer(levels=levels).to(self.device)
+        if not self._use_channel_adapter:
+            return approx
+
+        class _ChannelReduce(nn.Module):
+            def __init__(self, inner: nn.Module, levels: int):
+                super().__init__()
+                self.inner = inner
+                self.levels = int(levels)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                b, c, h, w = x.shape
+                encoded = self.inner(x)
+                return encoded.view(b, c, self.levels, h, w).mean(dim=2)
+
+        return _ChannelReduce(approx, levels=levels).to(self.device)
 
 
 class FeatureSqueezingDefense(DefenseWrapper):
@@ -247,7 +284,6 @@ class FeatureSqueezingDefense(DefenseWrapper):
             params={"bit_depth": int(bit_depth), "kernel_size": int(kernel_size)},
             requires_bpda=True,
             bpda_approximation="identity",
-            claimed_robust_accuracy=0.93,
         )
         super().__init__(base_model, spec, device)
         self.squeeze = BitDepthReduction(bits=bit_depth, differentiable=False)
@@ -316,7 +352,6 @@ class RandomizedSmoothingDefense(DefenseWrapper):
             params={"sigma": float(sigma), "n_samples": int(n_samples)},
             is_stochastic=True,
             eot_samples=50,
-            claimed_robust_accuracy=0.85,
         )
         super().__init__(base_model, spec, device)
         self.sigma = float(sigma)
@@ -364,7 +399,6 @@ class RandomPadCropDefense(DefenseWrapper):
             params={"pad_size": int(pad_size)},
             is_stochastic=True,
             eot_samples=30,
-            claimed_robust_accuracy=0.92,
         )
         super().__init__(base_model, spec, device)
         self.pad = RandomPadding(max_pad=pad_size, deterministic=False)
@@ -386,7 +420,6 @@ class RandomNoiseDefense(DefenseWrapper):
             params={"std": float(std)},
             is_stochastic=True,
             eot_samples=20,
-            claimed_robust_accuracy=0.86,
         )
         super().__init__(base_model, spec, device)
         self.noise = RandomNoise(std=std, deterministic=False)
@@ -408,7 +441,6 @@ class EnsembleDiversityDefense(DefenseWrapper):
             params={"n_models": len(models), "aggregation": aggregation},
             is_stochastic=(aggregation == "random"),
             eot_samples=max(1, len(models)),
-            claimed_robust_accuracy=0.88,
         )
         super().__init__(models[0], spec, device)
         self.models = nn.ModuleList([m.to(device).eval() for m in models])
@@ -452,7 +484,6 @@ class DefensiveDistillationDefense(DefenseWrapper):
             domain="malware",
             obfuscation_types=[ObfuscationType.VANISHING],
             params={"temperature": float(temperature)},
-            claimed_robust_accuracy=0.97,
         )
         super().__init__(base_model, spec, device)
         self.distill = DefensiveDistillation(base_model, temperature=temperature, inference_temperature=1.0)
@@ -471,7 +502,6 @@ class GradientRegularizationDefense(DefenseWrapper):
             domain="malware",
             obfuscation_types=[ObfuscationType.VANISHING],
             params={"lambda_grad": float(lambda_grad)},
-            claimed_robust_accuracy=0.87,
         )
         super().__init__(base_model, spec, device)
 
@@ -488,7 +518,6 @@ class SpatialSmoothingDefense(DefenseWrapper):
             domain="av_perception",
             obfuscation_types=[ObfuscationType.VANISHING],
             params={"kernel_size": int(kernel_size), "sigma": float(sigma)},
-            claimed_robust_accuracy=0.90,
         )
         super().__init__(base_model, spec, device)
         self.kernel_size = int(kernel_size)
@@ -521,7 +550,6 @@ class CertifiedDefense(DefenseWrapper):
             params={"sigma": float(sigma)},
             is_stochastic=True,
             eot_samples=100,
-            claimed_robust_accuracy=0.85,
         )
         super().__init__(base_model, spec, device)
         self.sigma = float(sigma)
@@ -543,7 +571,6 @@ class ATTransformDefense(DefenseWrapper):
             params={"noise_std": float(noise_std)},
             is_stochastic=True,
             eot_samples=20,
-            claimed_robust_accuracy=0.86,
         )
         super().__init__(base_model, spec, device)
         self.noise = RandomNoise(std=noise_std, deterministic=False)
@@ -565,7 +592,6 @@ class TotalVariationDefense(DefenseWrapper):
             params={"weight": float(weight), "n_iter": int(n_iter)},
             requires_bpda=True,
             bpda_approximation="tv",
-            claimed_robust_accuracy=0.82,
         )
         super().__init__(base_model, spec, device)
         self.tv = TotalVariationMinimization(weight=weight, n_iter=n_iter, differentiable=False)

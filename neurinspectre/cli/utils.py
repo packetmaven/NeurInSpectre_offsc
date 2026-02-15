@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 import yaml
 
@@ -423,23 +423,45 @@ def _load_model_from_path(
             return model
 
         state = obj.get("state_dict") or obj.get("model_state_dict")
+        # Support raw state-dict checkpoints saved as an OrderedDict
+        # (common torchvision format with keys like "layer1.0.conv1.weight").
+        if state is None:
+            looks_like_state_dict = bool(obj) and all(
+                isinstance(k, str) for k in obj.keys()
+            ) and any(torch.is_tensor(v) for v in obj.values())
+            if looks_like_state_dict:
+                state = obj
         if state is not None:
-            model_name = obj.get("model_name") or obj.get("architecture") or model_kwargs.get("model_name")
-            domain = obj.get("domain", model_kwargs.get("domain", "vision"))
-            training_type = obj.get("training_type", model_kwargs.get("training_type", "standard"))
-            dataset = obj.get("dataset", model_kwargs.get("dataset", "cifar10"))
+            model_name = (
+                obj.get("model_name")
+                or obj.get("architecture")
+                or cfg.get("model_name")
+                or cfg.get("architecture")
+                or model_kwargs.get("model_name")
+            )
+            domain = obj.get("domain", cfg.get("domain", model_kwargs.get("domain", "vision")))
+            training_type = obj.get(
+                "training_type",
+                cfg.get("training_type", model_kwargs.get("training_type", "standard")),
+            )
+            dataset = obj.get("dataset", cfg.get("dataset", model_kwargs.get("dataset", "cifar10")))
             if not model_name:
                 raise ValueError(
                     "Checkpoint is a state_dict without model_name. "
                     "Provide model_name via config or save a full module."
                 )
+            factory_kwargs = {
+                k: v
+                for k, v in model_kwargs.items()
+                if k not in {"model_name", "domain", "training_type", "dataset"}
+            }
             model = ModelFactory.load_model(
                 domain=domain,
                 model_name=model_name,
                 training_type=training_type,
                 dataset=dataset,
                 device=device,
-                **model_kwargs,
+                **factory_kwargs,
             )
             model.load_state_dict(state, strict=False)
             model.eval()
@@ -527,6 +549,8 @@ def load_dataset(
     dataset_name: str,
     *,
     data_path: Optional[str] = None,
+    labels_path: Optional[str] = None,
+    nuscenes_version: Optional[str] = None,
     num_samples: int = 1000,
     batch_size: int = 128,
     seed: int = 42,
@@ -537,7 +561,7 @@ def load_dataset(
 ) -> Tuple[DataLoader, torch.Tensor, torch.Tensor]:
     name = str(dataset_name).lower()
     pin_memory = _should_pin_memory(device)
-    if name in {"cifar10", "imagenet100", "ember", "nuscenes"}:
+    if name in {"cifar10", "imagenet100", "ember"}:
         kwargs: Dict[str, Any] = {
             "n_samples": int(num_samples),
             "seed": int(seed),
@@ -548,6 +572,22 @@ def load_dataset(
         }
         if data_path:
             kwargs["root"] = data_path
+        return DatasetFactory.get_dataset(name, **kwargs)
+    if name == "nuscenes":
+        kwargs = {
+            "n_samples": int(num_samples),
+            "seed": int(seed),
+            "batch_size": int(batch_size),
+            "num_workers": int(num_workers),
+            "pin_memory": bool(pin_memory),
+            "split": split,
+        }
+        if data_path:
+            kwargs["root"] = data_path
+        if labels_path:
+            kwargs["labels_path"] = labels_path
+        if nuscenes_version:
+            kwargs["version"] = nuscenes_version
         return DatasetFactory.get_dataset(name, **kwargs)
 
     if name == "cifar100":
@@ -742,7 +782,13 @@ def build_defense(
         "defensive_distillation": "defensive_distillation",
         "ensemble": "ensemble_diversity",
         "ensemble_diversity": "ensemble_diversity",
+        "feature_squeezing": "feature_squeezing",
+        "gradient_regularization": "gradient_regularization",
+        "at_transform": "at_transform",
+        "spatial_smoothing": "spatial_smoothing",
+        "certified_defense": "certified_defense",
         "random_pad_crop": "random_pad_crop",
+        "random_padcrop": "random_pad_crop",
         "random_noise": "random_noise",
         "total_variation": "total_variation",
     }
@@ -784,6 +830,10 @@ def _load_custom_defense(base_model: nn.Module, params: Dict[str, Any], *, devic
 def select_target_labels(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         logits = model(x)
+    # Binary-logit models may return shape [B] or [B,1]. In that case the only
+    # non-true class is the opposite label.
+    if logits.ndim == 1 or (logits.ndim == 2 and int(logits.size(1)) == 1):
+        return (1 - y).long()
     logits = logits.clone()
     logits[torch.arange(logits.size(0), device=logits.device), y] = -float("inf")
     return logits.argmax(dim=1)
@@ -806,6 +856,7 @@ def evaluate_attack_runner(
     clean_correct = 0
     adv_correct = 0
     success_total = 0
+    num_classes: Optional[int] = None
     perturbation_accum: Dict[str, float] = {}
     perturbation_count = 0
     query_counts = []
@@ -832,8 +883,23 @@ def evaluate_attack_runner(
                 y = y[:remaining]
                 batch_size = int(x.size(0))
 
+        def _preds_from_logits(logits: torch.Tensor) -> tuple[torch.Tensor, int]:
+            # Binary-logit models: threshold at 0 -> {0,1}
+            if logits.ndim == 1:
+                return (logits > 0).long(), 2
+            if logits.ndim == 2 and int(logits.size(1)) == 1:
+                return (logits.squeeze(1) > 0).long(), 2
+            if logits.ndim < 2:
+                # Unrecognized output shape; fall back to a safe sentinel.
+                b = int(logits.shape[0]) if logits.ndim >= 1 else 0
+                return torch.zeros(b, device=logits.device, dtype=torch.long), 0
+            return logits.argmax(dim=1), int(logits.size(1))
+
         with torch.no_grad():
-            clean_preds = eval_model(x).argmax(dim=1)
+            clean_logits = eval_model(x)
+            clean_preds, inferred_classes = _preds_from_logits(clean_logits)
+            if num_classes is None:
+                num_classes = int(inferred_classes)
         correct_mask = clean_preds == y
         clean_correct += int(correct_mask.sum().item())
         total += batch_size
@@ -860,7 +926,8 @@ def evaluate_attack_runner(
             preds_adv = result.predictions
         else:
             with torch.no_grad():
-                preds_adv = eval_model(x_adv).argmax(dim=1)
+                adv_logits = eval_model(x_adv)
+                preds_adv, _ = _preds_from_logits(adv_logits)
 
         success = preds_adv != y_attack
         success_total += int(success.sum().item())
@@ -929,6 +996,7 @@ def evaluate_attack_runner(
         "attack_success_rate": float(attack_success_rate),
         "samples": int(total),
         "correct_samples": int(clean_correct),
+        "num_classes": int(num_classes or 0),
         "perturbation": perturbation_summary,
         "query_efficiency": query_summary,
         "queries": queries_mean,

@@ -45,7 +45,7 @@ foolbox>=3.3.0
 robustbench>=1.0.0
 
 # Dataset tooling (real evaluations)
-ember>=0.1.0
+git+https://github.com/elastic/ember.git
 nuscenes-devkit>=1.1.10
 
 # Network Security and Analysis

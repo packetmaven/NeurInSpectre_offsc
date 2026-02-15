@@ -17,6 +17,7 @@ Version: 2.0
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -32,6 +33,8 @@ _CLICK_COMMANDS = {
     "characterize",
     "defense-analyzer",
     "evaluate",
+    "table2",
+    "table2-smoke",
     "compare",
     "config",
 }
@@ -101,13 +104,27 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     "--dataset",
     "-d",
     required=True,
-    type=click.Choice(["cifar10", "cifar100", "imagenet", "custom"]),
+    type=click.Choice(
+        ["cifar10", "cifar100", "imagenet", "imagenet100", "ember", "nuscenes", "custom"]
+    ),
     help="Dataset name",
 )
 @click.option(
     "--data-path",
     type=click.Path(exists=True),
     help="Path to custom dataset (required if dataset=custom)",
+)
+@click.option(
+    "--labels-path",
+    type=click.Path(exists=True),
+    help="Path to nuScenes label map JSON (required for dataset=nuscenes)",
+)
+@click.option(
+    "--nuscenes-version",
+    type=str,
+    default="v1.0-mini",
+    show_default=True,
+    help="nuScenes version string (e.g., v1.0-mini, v1.0-trainval)",
 )
 @click.option(
     "--defense",
@@ -120,6 +137,12 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
             "thermometer",
             "distillation",
             "ensemble",
+            "feature_squeezing",
+            "gradient_regularization",
+            "at_transform",
+            "spatial_smoothing",
+            "random_pad_crop",
+            "certified_defense",
             "custom",
         ]
     ),
@@ -301,10 +324,24 @@ def attack_cmd(ctx: click.Context, **kwargs) -> None:
     "--dataset",
     "-d",
     required=True,
-    type=click.Choice(["cifar10", "cifar100", "imagenet", "custom"]),
+    type=click.Choice(
+        ["cifar10", "cifar100", "imagenet", "imagenet100", "ember", "nuscenes", "custom"]
+    ),
     help="Dataset name",
 )
 @click.option("--data-path", type=click.Path(exists=True), help="Path to custom dataset")
+@click.option(
+    "--labels-path",
+    type=click.Path(exists=True),
+    help="Path to nuScenes label map JSON (required for dataset=nuscenes)",
+)
+@click.option(
+    "--nuscenes-version",
+    type=str,
+    default="v1.0-mini",
+    show_default=True,
+    help="nuScenes version string (e.g., v1.0-mini, v1.0-trainval)",
+)
 @click.option(
     "--defense",
     type=click.Choice(
@@ -316,6 +353,12 @@ def attack_cmd(ctx: click.Context, **kwargs) -> None:
             "thermometer",
             "distillation",
             "ensemble",
+            "feature_squeezing",
+            "gradient_regularization",
+            "at_transform",
+            "spatial_smoothing",
+            "random_pad_crop",
+            "certified_defense",
             "custom",
         ]
     ),
@@ -475,6 +518,12 @@ cli.add_command(characterize_cmd, name="defense-analyzer")
     help="Significance threshold in percentage points",
 )
 @click.option(
+    "--expected-asr-path",
+    "--expected-asr",
+    type=click.Path(exists=True),
+    help="Expected ASR baseline YAML/JSON for --mode baseline (kept out of repo)",
+)
+@click.option(
     "--json-output",
     type=click.Path(),
     help="Export executive report JSON to path",
@@ -516,14 +565,13 @@ def compare_cmd(ctx: click.Context, **kwargs) -> None:
         # Regression comparison between runs
         neurinspectre compare --mode runs run_a/summary.json run_b/summary.json --threshold 3.0
 
-        # Paper baseline comparison
-        neurinspectre compare --mode baseline eval_results/summary.json
+        # External baseline comparison (expected ASR kept out of repo)
+        neurinspectre compare --mode baseline eval_results/summary.json \\
+            --expected-asr-path /path/to/expected_asr.yaml
 
         # Characterization signal comparison
         neurinspectre compare --mode characterization char_results/*.json --sort-by alpha
 
-    Cross-ref: Paper Section 5.2.2 "Baseline comparison"
-    Cross-ref: Paper Table 1 "Attack success rate against evaluated defenses"
     """
     from .compare_cmd import run_compare
 
@@ -682,6 +730,258 @@ def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
     run_evaluation(ctx, **kwargs)
 
 
+@cli.command("table2")
+@click.option(
+    "--config",
+    "-c",
+    required=True,
+    type=click.Path(exists=True),
+    help="YAML configuration file for Table 2 evaluation",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase verbosity for this command",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(),
+    default="results/table2",
+    help="Output directory for all results",
+)
+@click.option(
+    "--strict-real-data/--no-strict-real-data",
+    default=True,
+    help="Require only real datasets and local assets",
+)
+@click.option(
+    "--strict-dataset-budgets/--no-strict-dataset-budgets",
+    default=True,
+    help="Require and enforce dataset-specific attack budgets",
+)
+@click.option(
+    "--allow-missing",
+    is_flag=True,
+    help="Allow missing local assets in strict checks",
+)
+@click.option(
+    "--json-output",
+    type=click.Path(),
+    help="Export executive report JSON to path",
+)
+@click.option(
+    "--sarif-output",
+    type=click.Path(),
+    help="Export SARIF report to path",
+)
+@click.option(
+    "--report-format",
+    type=click.Choice(["rich", "text"]),
+    default="rich",
+    help="Report output format",
+)
+@click.option(
+    "--report/--no-report",
+    default=True,
+    help="Print red-team findings to stdout",
+)
+@click.option(
+    "--brief",
+    is_flag=True,
+    help="Show only critical metrics",
+)
+@click.option(
+    "--summary-only",
+    is_flag=True,
+    help="Show executive summary only",
+)
+@click.option(
+    "--color",
+    is_flag=True,
+    help="Force color output (overrides NO_COLOR)",
+)
+@click.option(
+    "--no-color",
+    is_flag=True,
+    help="Disable color output",
+)
+@click.option(
+    "--no-progress",
+    is_flag=True,
+    help="Disable progress indicators",
+)
+@click.option(
+    "--defenses",
+    multiple=True,
+    help="Specific defenses to evaluate (default: all in config)",
+)
+@click.option(
+    "--attacks",
+    multiple=True,
+    help="Specific attacks to run (default: all)",
+)
+@click.option(
+    "--parallel",
+    "-j",
+    type=int,
+    default=1,
+    help="Number of parallel workers",
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    help="Resume interrupted evaluation",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["cuda", "cpu", "mps", "auto"]),
+    default="auto",
+    help="Device for computation",
+)
+@click.pass_context
+def table2_cmd(ctx: click.Context, **kwargs) -> None:
+    """
+    Run Table 2 pipeline with strict real-data checks.
+
+    This command normalizes Table 2 config variants, enforces real-dataset
+    constraints, and then executes the standard evaluation matrix runner.
+    """
+    from .table2_cmd import run_table2
+
+    run_table2(ctx, **kwargs)
+
+
+@cli.command("table2-smoke")
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase verbosity for this command",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(),
+    default="results/table2_smoke_real",
+    help="Output directory for all results",
+)
+@click.option(
+    "--data-root",
+    type=click.Path(),
+    default="./data",
+    help="Base directory used to discover datasets",
+)
+@click.option(
+    "--models-root",
+    type=click.Path(),
+    default="./models",
+    help="Base directory used to discover model artifacts",
+)
+@click.option(
+    "--pgd-steps",
+    type=int,
+    default=10,
+    show_default=True,
+    help="PGD steps for smoke run",
+)
+@click.option(
+    "--neurinspectre-steps",
+    type=int,
+    default=10,
+    show_default=True,
+    help="NeurInSpectre attack steps for smoke run",
+)
+@click.option(
+    "--json-output",
+    type=click.Path(),
+    help="Export executive report JSON to path",
+)
+@click.option(
+    "--sarif-output",
+    type=click.Path(),
+    help="Export SARIF report to path",
+)
+@click.option(
+    "--report-format",
+    type=click.Choice(["rich", "text"]),
+    default="rich",
+    help="Report output format",
+)
+@click.option(
+    "--report/--no-report",
+    default=True,
+    help="Print red-team findings to stdout",
+)
+@click.option(
+    "--brief",
+    is_flag=True,
+    help="Show only critical metrics",
+)
+@click.option(
+    "--summary-only",
+    is_flag=True,
+    help="Show executive summary only",
+)
+@click.option(
+    "--color",
+    is_flag=True,
+    help="Force color output (overrides NO_COLOR)",
+)
+@click.option(
+    "--no-color",
+    is_flag=True,
+    help="Disable color output",
+)
+@click.option(
+    "--no-progress",
+    is_flag=True,
+    help="Disable progress indicators",
+)
+@click.option(
+    "--defenses",
+    multiple=True,
+    help="Specific defenses to evaluate (default: all discovered)",
+)
+@click.option(
+    "--attacks",
+    multiple=True,
+    help="Specific attacks to run (default: all)",
+)
+@click.option(
+    "--parallel",
+    "-j",
+    type=int,
+    default=1,
+    help="Number of parallel workers",
+)
+@click.option(
+    "--resume",
+    is_flag=True,
+    help="Resume interrupted evaluation",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["cuda", "cpu", "mps", "auto"]),
+    default="auto",
+    help="Device for computation",
+)
+@click.pass_context
+def table2_smoke_cmd(ctx: click.Context, **kwargs) -> None:
+    """
+    Run a small, real-data Table2 smoke matrix.
+
+    Discovers which datasets/models are available locally, generates a minimal
+    config, then runs the standard `table2` pipeline with strict real-data
+    checks (validity + integrity gates enabled).
+    """
+
+    from .table2_smoke_cmd import run_table2_smoke
+
+    run_table2_smoke(ctx, **kwargs)
+
+
 @cli.command("config")
 @click.argument("config_type", type=click.Choice(["attack", "defense", "evaluation"]))
 @click.option("--output", "-o", type=click.Path(), help="Output file (default: stdout)")
@@ -713,10 +1013,23 @@ def main() -> None:
     try:
         argv = sys.argv[1:]
         if argv and argv[0] not in _CLICK_COMMANDS and argv[0] not in {"-h", "--help", "--version"}:
-            from .__main__ import main as legacy_main
+            enable_legacy = str(os.environ.get("NEURINSPECTRE_ENABLE_LEGACY_CLI", "")).lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            if enable_legacy:
+                from .__main__ import main as legacy_main
 
-            legacy_main()
-            return
+                legacy_main()
+                return
+            print(
+                f"[ERROR] Unknown command: {argv[0]!r}\n"
+                "Legacy CLI fallback is disabled by default.\n"
+                "Run `neurinspectre --help` to see supported commands.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         cli(obj={})
     except Exception as e:  # pragma: no cover - CLI error handling
         logger.error("Fatal error: %s", e, exc_info=True)

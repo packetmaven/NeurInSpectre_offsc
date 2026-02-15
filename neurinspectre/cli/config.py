@@ -43,7 +43,11 @@ defense:
 
 
 def _evaluation_config() -> str:
-    return """# evaluation.yaml - Reproduce Paper Table 1 results
+    return """# evaluation.yaml - Example evaluation configuration
+
+# NOTE: This repo does not ship paper baseline numbers. If you want to validate
+# results against an expected ASR matrix, provide it via an external file using
+# baseline_validation.expected_asr_path.
 
 defenses:
   - name: jpeg_compression
@@ -56,9 +60,9 @@ defenses:
     num_samples: 100
 
 attacks:
-  - neurinspectre  # Adaptive (Paper Section 3)
+  - neurinspectre  # Adaptive attack synthesis
   - apgd           # Baseline (Croce & Hein 2020)
-  - autoattack     # Comparison (Paper Section 5.2.2)
+  - autoattack     # Comparative baseline attack
 
 datasets:
   cifar10:
@@ -68,4 +72,16 @@ datasets:
 perturbation:
   epsilon: 0.03137  # 8/255
   norm: Linf
+
+validity_gates:
+  enabled: false
+  strict: false
+  # Optional: require clean accuracy above uniform chance by a margin (AE hygiene).
+  min_clean_accuracy_over_chance: 0.05
+
+baseline_validation:
+  enabled: false
+  strict: false
+  tolerance: 0.02
+  expected_asr_path: /abs/path/to/expected_asr.yaml
 """

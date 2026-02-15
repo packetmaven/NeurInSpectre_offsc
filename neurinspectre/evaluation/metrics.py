@@ -95,11 +95,11 @@ def compute_perturbation_metrics(
         "linf_mean": float(linf.mean().item()),
         "linf_max": float(linf.max().item()),
         "linf_min": float(linf.min().item()),
-        "linf_std": float(linf.std().item()),
+        "linf_std": float(linf.std(unbiased=False).item()),
         "l2_mean": float(l2.mean().item()),
         "l2_max": float(l2.max().item()),
         "l2_min": float(l2.min().item()),
-        "l2_std": float(l2.std().item()),
+        "l2_std": float(l2.std(unbiased=False).item()),
         "l1_mean": float(l1.mean().item()),
         "l0_mean": float(l0.mean().item()),
     }

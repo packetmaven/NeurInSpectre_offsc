@@ -24,7 +24,13 @@ from ..evaluation.metrics import (
     compute_robust_accuracy,
 )
 from ..evaluation.datasets import DatasetFactory
-from ..models import ModelFactory
+from ..evaluation.budgets import resolve_attack_config
+from ..evaluation.baseline_validation import (
+    build_observed_asr_matrix,
+    load_expected_asr,
+    validate_asr_matrix,
+)
+from ..cli.utils import load_model as load_model_util
 
 
 @dataclass
@@ -79,6 +85,9 @@ class Table1Reproducer:
         else:
             self.config_path = Path(config_path) if config_path else None
             self.config = config
+        self.config_base_dir = (
+            self.config_path.parent if self.config_path is not None else Path.cwd()
+        )
         self.device = self._resolve_device(device)
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +96,7 @@ class Table1Reproducer:
         self.results: List[DefenseResult] = []
         self.dataset_cache = self._init_dataset_cache()
         self.attack_checkpoint = self._init_attack_checkpoint()
+        self.baseline_validation_report: Dict[str, Any] = {}
 
     def _load_config(self) -> Dict[str, Any]:
         if self.config_path is None:
@@ -141,6 +151,7 @@ class Table1Reproducer:
                     continue
                 raise
 
+        self.baseline_validation_report = self._run_baseline_validation()
         return self.results
 
     def _evaluate_defense(self, defense_name: str, defense_cfg: Dict[str, Any]) -> DefenseResult:
@@ -188,9 +199,21 @@ class Table1Reproducer:
         characterization = self._characterize_defense(defended_model, loader)
 
         attacks_cfg = self.config.get("attacks", {})
-        pgd_summary = self._run_attack("pgd", defended_model, x_correct, y_correct, attacks_cfg.get("pgd", {}))
+        pgd_summary = self._run_attack(
+            "pgd",
+            defended_model,
+            x_correct,
+            y_correct,
+            attacks_cfg.get("pgd", {}),
+            dataset_name=dataset_name,
+        )
         aa_summary = self._run_attack(
-            "autoattack", defended_model, x_correct, y_correct, attacks_cfg.get("autoattack", {})
+            "autoattack",
+            defended_model,
+            x_correct,
+            y_correct,
+            attacks_cfg.get("autoattack", {}),
+            dataset_name=dataset_name,
         )
         nis_summary = self._run_attack(
             "neurinspectre",
@@ -198,6 +221,7 @@ class Table1Reproducer:
             x_correct,
             y_correct,
             attacks_cfg.get("neurinspectre", {}),
+            dataset_name=dataset_name,
             characterization=characterization,
             loader=loader,
         )
@@ -262,19 +286,13 @@ class Table1Reproducer:
     def _load_model(self, model_cfg: Any, dataset_name: str, domain: str):
         if isinstance(model_cfg, str):
             model_cfg = {"model_name": model_cfg}
-        model_name = model_cfg.get("model_name") or model_cfg.get("architecture") or model_cfg.get("name")
-        training_type = model_cfg.get("training_type", "standard")
-        extra_cfg = dict(model_cfg)
-        # Avoid passing duplicate keywords that are already provided explicitly.
-        for key in ("model_name", "architecture", "name", "training_type", "dataset", "domain", "device"):
-            extra_cfg.pop(key, None)
-        return ModelFactory.load_model(
-            domain=domain,
-            model_name=model_name,
-            training_type=training_type,
-            dataset=model_cfg.get("dataset", dataset_name),
+        training_type = model_cfg.get("training_type", "standard") if isinstance(model_cfg, dict) else "standard"
+        return load_model_util(
+            model_cfg,
+            dataset=model_cfg.get("dataset", dataset_name) if isinstance(model_cfg, dict) else dataset_name,
             device=self.device,
-            **extra_cfg,
+            domain=domain,
+            training_type=training_type,
         )
 
     def _model_label(self, model_cfg: Any) -> str:
@@ -322,9 +340,16 @@ class Table1Reproducer:
         y: torch.Tensor,
         cfg: Dict[str, Any],
         *,
+        dataset_name: str,
         characterization=None,
         loader=None,
     ) -> Dict[str, Any]:
+        cfg = resolve_attack_config(
+            self.config,
+            attack_cfg=dict(cfg or {}),
+            dataset_name=dataset_name,
+            strict_budget=self._strict_dataset_budgets(),
+        )
         checkpoint_key = f"{attack_type}:{self._attack_config_signature(cfg)}"
         if self.attack_checkpoint and self.attack_checkpoint.exists(checkpoint_key):
             saved = self.attack_checkpoint.load(checkpoint_key)
@@ -446,6 +471,54 @@ class Table1Reproducer:
             parts.append(f"{k}={cfg[k]}")
         return "|".join(parts)
 
+    def _strict_dataset_budgets(self) -> bool:
+        policy = self.config.get("budget_policy", {}) if isinstance(self.config, dict) else {}
+        if isinstance(policy, dict) and "strict_dataset_budgets" in policy:
+            return bool(policy.get("strict_dataset_budgets"))
+        return bool(self.config.get("strict_dataset_budgets", False))
+
+    def _run_baseline_validation(self) -> Dict[str, Any]:
+        validation_cfg = dict(self.config.get("baseline_validation", {}) or {})
+        if not validation_cfg or not bool(validation_cfg.get("enabled", False)):
+            return {"enabled": False}
+
+        expected = load_expected_asr(validation_cfg, base_dir=self.config_base_dir)
+        if not expected:
+            if bool(validation_cfg.get("strict", False)):
+                raise RuntimeError(
+                    "baseline_validation.enabled=true but no expected ASR map provided "
+                    "(use expected_asr or expected_asr_path)."
+                )
+            return {"enabled": True, "passed": False, "reason": "missing_expected_asr"}
+
+        observed_rows = []
+        for r in self.results:
+            observed_rows.extend(
+                [
+                    (r.defense_name, "pgd", float(r.pgd_asr)),
+                    (r.defense_name, "autoattack", float(r.autoattack_asr)),
+                    (r.defense_name, "neurinspectre", float(r.neurinspectre_asr)),
+                ]
+            )
+
+        tolerance = float(validation_cfg.get("tolerance", 0.02))
+        require_all = bool(validation_cfg.get("require_all_expected", True))
+        report = validate_asr_matrix(
+            build_observed_asr_matrix(observed_rows),
+            expected,
+            tolerance=tolerance,
+            require_all_expected=require_all,
+        )
+        report["enabled"] = True
+
+        if bool(validation_cfg.get("strict", False)) and not bool(report.get("passed", False)):
+            raise RuntimeError(
+                "Baseline validation failed: "
+                f"{report.get('failed_count', 0)} pairs out of tolerance, "
+                f"{report.get('missing_expected_count', 0)} missing expected pairs."
+            )
+        return report
+
     def save_results(self, output_path: str) -> None:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -453,7 +526,10 @@ class Table1Reproducer:
             handle.write(self._results_to_csv())
 
         json_path = output_path.with_suffix(".json")
-        payload = {"results": [r.to_dict() for r in self.results]}
+        payload = {
+            "results": [r.to_dict() for r in self.results],
+            "baseline_validation": self.baseline_validation_report,
+        }
         json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def plot_results(self, output_path: str) -> None:
@@ -488,14 +564,27 @@ class Table1Reproducer:
         if not self.results:
             return
         print("\nTable 1: Attack Success Rates")
-        print(f"{'Defense':<30} {'PGD':>8} {'AA':>8} {'Ours':>8} {'Claimed':>10}")
+        has_claimed = any(float(getattr(r, "claimed_robust_accuracy", 0.0) or 0.0) > 0.0 for r in self.results)
+        if has_claimed:
+            print(f"{'Defense':<30} {'PGD':>8} {'AA':>8} {'Ours':>8} {'Claimed':>10}")
+        else:
+            print(f"{'Defense':<30} {'PGD':>8} {'AA':>8} {'Ours':>8}")
         for r in self.results:
-            print(
+            row = (
                 f"{r.defense_name:<30} "
                 f"{r.pgd_asr*100:>7.1f}% "
                 f"{r.autoattack_asr*100:>7.1f}% "
-                f"{r.neurinspectre_asr*100:>7.1f}% "
-                f"{r.claimed_robust_accuracy*100:>9.0f}%"
+                f"{r.neurinspectre_asr*100:>7.1f}%"
+            )
+            if has_claimed:
+                row = f"{row} {r.claimed_robust_accuracy*100:>9.0f}%"
+            print(row)
+        if self.baseline_validation_report.get("enabled"):
+            status = "PASS" if self.baseline_validation_report.get("passed") else "FAIL"
+            print(
+                f"\nBaseline validation: {status} "
+                f"(failed={self.baseline_validation_report.get('failed_count', 0)}, "
+                f"missing={self.baseline_validation_report.get('missing_expected_count', 0)})"
             )
 
     def _results_to_csv(self) -> str:

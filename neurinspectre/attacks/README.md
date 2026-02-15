@@ -29,10 +29,10 @@ attack_rr = PGDWithRestarts(model, n_restarts=10, eps=8/255, steps=40)
 x_adv_rr = attack_rr(x_clean, y_true)
 ```
 
-Expected performance (Table 1):
-- JPEG Compression: 12.4% ASR
-- Defensive Distillation: 6.2% ASR
-- Average across 12 defenses: 23.4% ASR
+Notes on expected results:
+- This repo intentionally does not ship paper baselines or expected ASR tables.
+- If you want baseline validation, pass expected values in an external file and
+  use the CLI comparison/validation utilities.
 
 ### 2. Auto-PGD (APGD)
 - File: `apgd.py`
@@ -120,7 +120,9 @@ attack.train_approximation(train_loader)
 x_adv = attack(x_clean, y_true)
 ```
 
-Impact (Table 2 ablation): BPDA provides +22.9pp improvement (71.4% -> 94.3%).
+Rationale:
+BPDA is a key component for evaluating non-differentiable defenses without
+mistaking gradient masking for robustness.
 
 ### 5. EOT (Expectation Over Transformation)
 - File: `eot.py`
@@ -213,13 +215,13 @@ from neurinspectre.attacks.numerics import (
 )
 ```
 
-## Cross-Reference to Paper Claims
+## Cross-Reference to Paper Components
 
-| Paper Claim | LaTeX Location | Implementation | Status |
+| Paper Component | LaTeX Location | Implementation | Status |
 | --- | --- | --- | --- |
-| PGD baseline 23.4% ASR | Table 1 | `pgd.py` | OK |
-| AutoAttack 64.8% ASR | Table 1 | `autoattack.py` | OK |
-| BPDA +22.9pp improvement | Table 2 | `bpda.py` | OK |
+| PGD baseline | Table 1 | `pgd.py` | OK |
+| AutoAttack baseline | Table 1 | `autoattack.py` | OK |
+| BPDA (ablation component) | Table 2 | `bpda.py` | OK |
 | EOT variance reduction | Section 4 | `eot.py` | OK |
 | Square Attack validation | Section 3.3 | `square.py` | OK |
 | DLR loss gain | Research | `losses/dlr_loss.py` | OK |
@@ -238,20 +240,11 @@ Run with coverage:
 pytest --cov=neurinspectre/attacks tests/
 ```
 
-## Expected Performance (Table 1)
+## Expected Performance
 
-| Defense | PGD | AutoAttack | NeurInSpectre (Week 2) |
-| --- | --- | --- | --- |
-| JPEG Compression | 12.4% | 67.3% | 98.2% |
-| Bit-Depth Reduction | 8.7% | 71.8% | 97.4% |
-| Rand. Smoothing | 31.2% | 58.4% | 89.3% |
-| Defensive Distillation | 6.2% | 52.1% | 94.6% |
-| Average | 23.4% | 64.8% | 94.3% |
-
-## Week 1 Status
-
-- PGD and AutoAttack baselines implemented and validated.
-- Week 2 goal: implement MA-PGD to reach ~94.3% average ASR.
+Expected ASR/robust-accuracy values depend on the exact checkpoints, dataset
+versions, preprocessing, and budgets. For scientific hygiene, keep "expected"
+tables outside the repo and load them explicitly when validating results.
 
 ## References
 
