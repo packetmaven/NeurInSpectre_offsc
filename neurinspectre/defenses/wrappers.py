@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -374,20 +375,53 @@ class RandomizedSmoothingDefense(DefenseWrapper):
         return self.transform
 
     def certified_radius(self, x: torch.Tensor, n_samples: int = 1000) -> float:
+        """
+        Estimate a randomized-smoothing certified radius for a single sample.
+
+        Notes:
+        - This is a lightweight estimator used for diagnostics and failure analysis.
+        - `scipy.stats.norm.ppf(1.0)` is `inf`, so we clamp p_a away from 1.0.
+        """
         try:
             from scipy.stats import norm as _norm
         except Exception as exc:
             raise ImportError("scipy is required for certified radius computation") from exc
+
+        n_samples = int(n_samples)
+        if n_samples <= 0:
+            raise ValueError(f"n_samples must be >= 1, got {n_samples}")
+        if x.ndim == 0 or int(x.shape[0]) != 1:
+            raise ValueError("certified_radius expects a single input (batch_size==1).")
+
         counts = None
         with torch.no_grad():
             for _ in range(n_samples):
                 logits = self.base_model(self.transform(x))
                 preds = logits.argmax(dim=1)
                 if counts is None:
-                    counts = torch.zeros(logits.size(1), device=x.device)
-                counts[preds] += 1
-        p_a = (counts.max() / n_samples).item() if counts is not None else 0.0
-        return self.sigma * _norm.ppf(p_a) if p_a > 0.5 else 0.0
+                    if logits.ndim != 2 or int(logits.size(0)) != 1:
+                        raise ValueError(
+                            "certified_radius expects logits with shape (1, C). "
+                            f"Got shape={tuple(logits.shape)}"
+                        )
+                    counts = torch.zeros(int(logits.size(1)), device=x.device, dtype=torch.float32)
+                # Use scatter_add_ so repeated indices accumulate correctly.
+                counts.scatter_add_(0, preds.to(torch.int64), torch.ones_like(preds, dtype=counts.dtype))
+
+        if counts is None or float(counts.sum().item()) <= 0.0:
+            return 0.0
+
+        p_a = float((counts.max() / counts.sum()).item())
+        if p_a <= 0.5:
+            return 0.0
+
+        # Clamp away from {0,1} to keep ppf finite.
+        eps = 1e-6
+        p_a = max(0.5 + eps, min(p_a, 1.0 - eps))
+        radius = float(self.sigma) * float(_norm.ppf(p_a))
+        if (not math.isfinite(radius)) or radius < 0.0:
+            return 0.0
+        return float(radius)
 
 
 class RandomPadCropDefense(DefenseWrapper):

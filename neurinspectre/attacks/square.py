@@ -39,8 +39,15 @@ class SquareAttack(Attack):
         if self.loss_type not in {"margin", "ce"}:
             raise ValueError("loss_type must be 'margin' or 'ce'.")
 
-        # Ensure sufficient queries for convergence
-        assert self.n_queries >= 1000, "Square Attack requires ≥1000 queries for reliable results"
+        # Ensure sufficient queries for convergence.
+        #
+        # NOTE: Don't use `assert` here: python -O disables asserts, which would
+        # silently permit meaningless "ran but didn't search" outcomes.
+        if self.n_queries < 1000:
+            raise ValueError(
+                "Square Attack requires >=1000 queries for reliable results "
+                f"(got n_queries={self.n_queries})."
+            )
 
     def _margin_loss(self, logits: torch.Tensor, y: torch.Tensor, targeted: bool = False) -> torch.Tensor:
         """

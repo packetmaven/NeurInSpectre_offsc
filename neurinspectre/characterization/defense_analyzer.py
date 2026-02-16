@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import warnings
 
 import numpy as np
@@ -120,6 +120,20 @@ class DefenseAnalyzer:
         self.KRYLOV_NORM_RATIO_VANISHING = 0.3
         self.KRYLOV_NORM_GROWTH_SHATTERED = 0.3
 
+        # Practical stability heuristics:
+        # Below this, Volterra/autocorr estimates are often too noisy to support
+        # strong claims (used for failure-mode reporting and conservative gating).
+        self.MIN_GRADIENT_SEQUENCE_LEN = 64
+        # Scale-free RMSE (RMSE / std(grad_history)) threshold for flagging a
+        # poor Volterra fit (error comparable to the signal scale).
+        #
+        # This is used for failure-analysis reporting and confidence downweighting,
+        # not as a hard gate for the full pipeline.
+        # Empirically, clean/stable runs tend to produce rmse_scaled closer to ~1,
+        # while heavily stochastic defenses push it higher. We flag >1.2 as "high"
+        # to support failure-mode reporting without affecting core attack logic.
+        self.VOLTERRA_RMSE_SCALED_MAX = 1.2
+
     def characterize(
         self,
         data_loader: torch.utils.data.DataLoader,
@@ -139,7 +153,20 @@ class DefenseAnalyzer:
 
         if self.verbose:
             print("[DefenseAnalyzer] Fitting Volterra kernel...")
-        alpha_volterra, volterra_rmse = self._fit_volterra_kernel(gradients)
+        alpha_volterra, volterra_rmse, volterra_rmse_scaled, volterra_fit_info = (
+            self._fit_volterra_kernel(gradients)
+        )
+        n_grad = int(len(gradients))
+        short_grad_history = n_grad < int(self.MIN_GRADIENT_SEQUENCE_LEN)
+        volterra_opt_success = bool(volterra_fit_info.get("success", False))
+        # "OK for use" means: scale isn't degenerate (so rmse_scaled is finite).
+        # The optimizer may still report success=False while returning a usable estimate.
+        volterra_fit_ok = bool(np.isfinite(volterra_rmse_scaled))
+        volterra_high_rmse = (
+            bool(volterra_fit_ok)
+            and np.isfinite(volterra_rmse_scaled)
+            and float(volterra_rmse_scaled) > float(self.VOLTERRA_RMSE_SCALED_MAX)
+        )
 
         if self.verbose:
             print("[DefenseAnalyzer] Analyzing gradient statistics...")
@@ -164,10 +191,11 @@ class DefenseAnalyzer:
             jacobian_rank,
             timescale,
             spectral_signals,
+            volterra_fit_ok,
         )
 
         requires_bpda, requires_eot, requires_mapgd = self._recommend_attacks(
-            obfuscation_types, etd_score, alpha_volterra
+            obfuscation_types, etd_score, alpha_volterra, volterra_fit_ok
         )
 
         eot_samples = self._recommend_eot_samples(grad_variance, requires_eot)
@@ -177,9 +205,11 @@ class DefenseAnalyzer:
             etd_score,
             alpha_volterra,
             volterra_rmse,
+            volterra_rmse_scaled,
             grad_variance,
             grad_norm_mean,
             jacobian_rank,
+            n_grad,
         )
 
         characterization = DefenseCharacterization(
@@ -197,10 +227,18 @@ class DefenseAnalyzer:
             confidence=confidence,
             metadata={
                 "volterra_rmse": volterra_rmse,
+                "volterra_rmse_scaled": volterra_rmse_scaled,
+                "volterra_fit": volterra_fit_info,
+                "volterra_optimizer_success": bool(volterra_opt_success),
+                "volterra_fit_ok": bool(volterra_fit_ok),
+                "volterra_high_rmse": bool(volterra_high_rmse),
+                "volterra_rmse_scaled_threshold": float(self.VOLTERRA_RMSE_SCALED_MAX),
+                "short_gradient_history": bool(short_grad_history),
+                "min_recommended_gradient_samples": int(self.MIN_GRADIENT_SEQUENCE_LEN),
                 "autocorrelation": autocorr.tolist()
                 if isinstance(autocorr, np.ndarray)
                 else autocorr,
-                "n_samples_analyzed": len(gradients),
+                "n_samples_analyzed": n_grad,
                 "grad_norm_mean": grad_norm_mean,
                 "stochastic_score": stochastic_score,
                 "krylov_rel_error_mean": spectral_signals.get("rel_error_mean"),
@@ -321,8 +359,12 @@ class DefenseAnalyzer:
             self.model.eval()
         return float(np.clip(etd_score, 0.0, 2.0))
 
-    def _fit_volterra_kernel(self, gradients: List[np.ndarray]) -> Tuple[float, float]:
-        grad_array = np.array(gradients)
+    def _fit_volterra_kernel(self, gradients: List[np.ndarray]) -> Tuple[float, float, float, Dict[str, Any]]:
+        if not gradients:
+            return 0.5, np.nan, np.nan, {"success": False, "message": "empty gradient sequence"}
+
+        grad_array = np.array(gradients, dtype=np.float64)
+        info_out: Dict[str, Any] = {}
         try:
             kernel, rmse, info = fit_volterra_kernel(
                 grad_array,
@@ -330,15 +372,25 @@ class DefenseAnalyzer:
                 method="L-BFGS-B",
                 verbose=False,
             )
-            if not info.get("success", False):
-                warnings.warn("Volterra fitting did not converge, using alpha=0.5")
-                return 0.5, np.nan
-            alpha = float(kernel.alpha)
+            info_out.update(dict(info or {}))
+            if not info_out.get("success", False):
+                warnings.warn("Volterra fitting did not converge; fit may be unreliable.")
+            alpha = float(getattr(kernel, "alpha", 0.5))
         except Exception as exc:
+            info_out.setdefault("success", False)
+            info_out["message"] = str(exc)
             warnings.warn(f"Volterra fitting failed: {exc}, using alpha=0.5")
-            return 0.5, np.nan
+            return 0.5, np.nan, np.nan, info_out
 
-        return alpha, float(rmse)
+        rmse = float(rmse)
+        # Scale-free fit error: avoids thresholds tied to raw gradient scale.
+        scale = float(np.std(grad_array))
+        if np.isfinite(scale) and scale > 1e-12 and np.isfinite(rmse):
+            rmse_scaled = float(rmse / scale)
+        else:
+            rmse_scaled = np.nan
+        info_out["rmse_scaled"] = float(rmse_scaled) if np.isfinite(rmse_scaled) else np.nan
+        return alpha, float(rmse), float(rmse_scaled), info_out
 
     def _compute_gradient_variance(
         self,
@@ -478,6 +530,7 @@ class DefenseAnalyzer:
         jacobian_rank: float,
         timescale: float,
         spectral_signals: Dict[str, float],
+        volterra_fit_ok: bool,
     ) -> List[ObfuscationType]:
         obfuscation_types: List[ObfuscationType] = []
 
@@ -526,6 +579,7 @@ class DefenseAnalyzer:
         if (
             self.ALPHA_SHATTERED_THRESHOLD <= alpha_volterra < self.ALPHA_RL_THRESHOLD
             and timescale > self.AUTOCORR_RL_THRESHOLD
+            and bool(volterra_fit_ok)
         ):
             obfuscation_types.append(ObfuscationType.RL_TRAINED)
             if self.verbose:
@@ -546,6 +600,7 @@ class DefenseAnalyzer:
         obfuscation_types: List[ObfuscationType],
         etd_score: float,
         alpha_volterra: float,
+        volterra_fit_ok: bool,
     ) -> Tuple[bool, bool, bool]:
         if len(obfuscation_types) == 1 and obfuscation_types[0] == ObfuscationType.NONE:
             return False, False, False
@@ -556,7 +611,7 @@ class DefenseAnalyzer:
         requires_eot = ObfuscationType.STOCHASTIC in obfuscation_types
         requires_mapgd = (
             ObfuscationType.RL_TRAINED in obfuscation_types
-            or alpha_volterra < self.ALPHA_RL_THRESHOLD
+            or (bool(volterra_fit_ok) and alpha_volterra < self.ALPHA_RL_THRESHOLD)
         )
         return requires_bpda, requires_eot, requires_mapgd
 
@@ -578,12 +633,17 @@ class DefenseAnalyzer:
         etd_score: float,
         alpha_volterra: float,
         volterra_rmse: float,
+        volterra_rmse_scaled: float,
         grad_variance: float,
         grad_norm_mean: float,
         jacobian_rank: float,
+        n_grad: int,
     ) -> float:
-        if np.isnan(volterra_rmse):
-            volterra_conf = 0.5
+        # Prefer the scale-free RMSE when available.
+        if np.isfinite(volterra_rmse_scaled):
+            volterra_conf = float(np.exp(-float(volterra_rmse_scaled)))
+        elif np.isnan(volterra_rmse):
+            volterra_conf = 0.5  # unknown fit quality
         else:
             volterra_conf = np.exp(-volterra_rmse * 10)
         etd_conf = 1.0 - np.exp(-abs(etd_score - 0.5) * 3)
@@ -591,10 +651,12 @@ class DefenseAnalyzer:
         grad_conf = 1.0 - np.exp(-float(grad_norm_mean) / grad_scale)
         rank_scale = max(self.RANK_VANISHING_THRESHOLD, 1e-6)
         rank_conf = float(np.clip(jacobian_rank / rank_scale, 0.0, 1.0))
+        n_factor = float(np.clip(float(n_grad) / float(self.MIN_GRADIENT_SEQUENCE_LEN), 0.0, 1.0))
         confidence = (
             np.sqrt(volterra_conf * etd_conf)
             * max(grad_conf, 1e-3)
             * max(rank_conf, 1e-3)
+            * max(n_factor, 1e-3)
         )
         return float(np.clip(confidence, 0.0, 1.0))
 
