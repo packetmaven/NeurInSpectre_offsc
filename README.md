@@ -2,18 +2,73 @@
   <img src="NeurInSpectre2.png" alt="NeurInSpectre Logo" width="800"/>
 </p>
 
-# NeurInSpectre – AI Security Interpretablity
+# NeurInSpectre
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3-green.svg)](https://developer.apple.com/metal/)
 [![NVIDIA CUDA](https://img.shields.io/badge/NVIDIA-CUDA-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
-> **A neural network security analysis framework for offensive and defensive AI security operations and AI interpretability.**
+> **Offensive framework for evaluating and breaking gradient obfuscation (Spectral–Volterra–Krylov).**
 
-**NeurInSpectre** provides real-time threat detection, gradient analysis, and interactive visualization for AI/ML security researchers. Built for red teams, blue teams, and security professionals.
+NeurInSpectre is a research codebase + CLI built to run on real datasets and real model artifacts. It provides:
+
+- Defense characterization signals (spectral / Volterra memory / Krylov-ETD)
+- Adaptive attacks (BPDA / EOT / Volterra memory) and evaluation pipelines
+- Strict real-data + validity/integrity gates (prevents meaningless ASR reporting)
+
+## Quickstart (Real-Data Smoke)
+
+```bash
+python -m venv .venv-neurinspectre
+source .venv-neurinspectre/bin/activate
+python -m pip install -U pip
+python -m pip install -e ".[dev]"
+
+neurinspectre doctor --as-json
+neurinspectre table2-smoke --output-dir results/table2_smoke --device auto --no-progress --summary-only
+```
+
+## Reproducibility (Paper / Artifact)
+
+See `REPRODUCE.md` for the table-to-command mapping and artifact workflow.
+
+Policy: this repo intentionally does not ship paper "expected" ASR/RA numbers. If you want strict validation,
+supply them via an external YAML/JSON file and run:
+
+```bash
+neurinspectre compare --mode baseline results/table2/summary.json --expected-asr-path /abs/path/to/expected_asr.yaml
+```
+
+## Documentation
+
+- `REPRODUCE.md` (paper-aligned evaluation + artifacts)
+- `docs/guides/` (focused guides)
+- `docs/README_INDEX.md` (extended/legacy CLI + dashboards)
+
+## Data & Model Assets (Real Data Only)
+
+NeurInSpectre does not commit large datasets. By default the CLI expects:
+
+- `data/cifar10/` (torchvision can download)
+- `data/imagenet/{train,val}/...` (ImageFolder layout)
+- `data/ember/ember_2018/{X_test.dat,y_test.dat,...}`
+- `data/nuscenes/` with `v1.0-mini/` and `label_map.json`
+- `models/` with Torch/TorchScript artifacts referenced by configs
+
+For an AE-friendly check of what is runnable on disk, use `neurinspectre table2-smoke`.
+
+## Docker (Optional)
+
+```bash
+docker build -t neurinspectre:ae --build-arg INSTALL_DEV=0 .
+docker run --rm -it neurinspectre:ae neurinspectre doctor
+```
 
 ---
+
+<details>
+<summary><b>Legacy / extended documentation (dashboards, ops playbooks, research notes)</b></summary>
 
 # NeurInSpectre
 <a id="tldr"></a>
@@ -8603,11 +8658,19 @@ Based on **SoK: Comprehensive Causality Analysis Framework** (Dec 2025):
 
 **Questions? Issues? Contributions?**
 
-Open an issue at: https://github.com/packetmaven/NeurInSpectre_branch2/issues
+Open an issue at: https://github.com/packetmaven/NeurInSpectre/issues
 
 
 ---
 
 
 ---
+
+---
+
+</details>
+
+## License
+
+MIT (see `LICENSE`).
 
