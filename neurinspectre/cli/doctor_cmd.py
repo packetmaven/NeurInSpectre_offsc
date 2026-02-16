@@ -345,7 +345,14 @@ def run_doctor(ctx: click.Context, **kwargs: Any) -> None:
     installed = (deps.get("installed") or {}) if isinstance(deps, dict) else {}
     if declared and installed:
         click.echo("Dependencies (pyproject.toml -> installed):")
-        for name in sorted(installed.keys()):
-            v = installed.get(name)
-            click.echo(f"  - {name}=={v if v is not None else 'MISSING'}")
+        for req in list(declared.get("dependencies") or []):
+            dn = _dist_name_from_requirement(str(req))
+            v = installed.get(dn) if dn else None
+            click.echo(f"  - {req}  # installed: {v if v is not None else 'MISSING'}")
+        if declared.get("optional"):
+            click.echo("Optional dependencies (pyproject.toml -> installed):")
+            for req in list(declared.get("optional") or []):
+                dn = _dist_name_from_requirement(str(req))
+                v = installed.get(dn) if dn else None
+                click.echo(f"  - {req}  # installed: {v if v is not None else 'MISSING'}")
 
