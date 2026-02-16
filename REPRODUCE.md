@@ -121,6 +121,28 @@ neurinspectre attention-security \
   --out-html results/attention_security.html
 ```
 
+### Subnetwork Hijack (requires activations file)
+
+```bash
+neurinspectre subnetwork_hijack identify \
+  --activations path/to/activations.npy \
+  --n_clusters 8 \
+  --out-prefix results/snh_ \
+  --interactive
+```
+
+### EDNN Embedding Attacks (requires embeddings file)
+
+```bash
+neurinspectre adversarial-ednn \
+  --attack-type inversion \
+  --data path/to/embeddings.npy \
+  --model sentence-transformers/all-MiniLM-L6-v2 \
+  --device auto \
+  --output-dir results/ednn \
+  --verbose
+```
+
 ## Reproduction Script
 
 `scripts/reproduce_all.sh` is a convenience harness that:
