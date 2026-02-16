@@ -1,0 +1,65 @@
+# Keep docker build context small and deterministic.
+
+.git/
+.github/
+.cursor/
+.idea/
+.vscode/
+
+__pycache__/
+*.pyc
+
+.venv/
+.venv-neurinspectre/
+venv/
+venv*/
+env/
+ENV/
+
+.pytest_cache/
+htmlcov/
+.coverage*
+.mypy_cache/
+.ruff_cache/
+
+# Local datasets / model artifacts / outputs (AE users supply their own).
+data/
+models/
+checkpoints/
+results/
+evaluation_results/
+_cli_runs/
+_cli_smokes/
+_output/
+_smoke/
+_tmp/
+tmp/
+temp/
+temporary/
+
+# Large archive/data formats
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.tar.gz
+*.tgz
+*.tar
+*.bz2
+*.zip
+*.gz
+
+# Media / reports
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.html
+*.pdf
+*.pcap
+
+# Known huge local artifacts
+v1.0-mini.tgz
+
