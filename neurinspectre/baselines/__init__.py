@@ -10,7 +10,11 @@ Policy:
 from __future__ import annotations
 
 __all__ = [
+    "backdoor",
+    "gradinversion",
     "prompt_injection",
+    "textfooler",
     "text_attacks",
+    "wanet",
 ]
 

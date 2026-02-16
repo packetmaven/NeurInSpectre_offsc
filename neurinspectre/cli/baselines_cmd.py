@@ -154,11 +154,19 @@ def gradinv_run(**kwargs: Any) -> None:
         "baseline_method": str(method),
         "config": {
             "dataset": dataset,
+            "data_path": data_path,
             "batch_size": batch_size,
             "seed": seed,
             "device": str(device),
             "max_iterations": int(cfg.max_iterations),
             "optimizer": str(cfg.optimizer),
+            "learning_rate": float(cfg.learning_rate),
+            "model": {
+                "family": "cifar10",
+                "arch": "resnet20",
+                "pretrained": True,
+                "normalize": True,
+            },
         },
         "metrics": {
             "mse": mse,
@@ -286,6 +294,8 @@ def subnetwork_hijack_run(**kwargs: Any) -> None:
             "module": "subnetwork_hijack",
             "baseline": baseline,
             "config": {
+                "dataset": "cifar10",
+                "data_path": data_path,
                 "poison_rate": poison_rate,
                 "target_label": target_label,
                 "epochs": epochs,
@@ -293,6 +303,8 @@ def subnetwork_hijack_run(**kwargs: Any) -> None:
                 "lr": lr,
                 "seed": seed,
                 "device": str(device),
+                "train_samples": int(kwargs["train_samples"]),
+                "test_samples": int(kwargs["test_samples"]),
             },
             "metrics": {
                 "clean_accuracy": clean_acc,
@@ -333,6 +345,8 @@ def subnetwork_hijack_run(**kwargs: Any) -> None:
         "module": "subnetwork_hijack",
         "baseline": baseline,
         "config": {
+            "dataset": "cifar10",
+            "data_path": data_path,
             "poison_rate": poison_rate,
             "target_label": target_label,
             "epochs": epochs,
@@ -340,6 +354,8 @@ def subnetwork_hijack_run(**kwargs: Any) -> None:
             "lr": lr,
             "seed": seed,
             "device": str(device),
+            "train_samples": int(kwargs["train_samples"]),
+            "test_samples": int(kwargs["test_samples"]),
             "replace_prefix": str(used_prefix),
         },
         "metrics": {
