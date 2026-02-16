@@ -78,6 +78,15 @@ def run_textattack_recipe(
             "Text baselines require `torch` and `transformers` installed."
         ) from exc
 
+    # TextAttack uses a global device singleton (`textattack.shared.utils.device`)
+    # for some constraints (notably SBERT). Ensure the CLI's `--device` is honored.
+    try:
+        from textattack.shared import utils as ta_utils  # type: ignore
+
+        ta_utils.device = torch.device(str(device))
+    except Exception:
+        ta_utils = None
+
     recipe_key = str(recipe or "").strip().lower().replace("-", "_")
     recipe_map = {
         "textfooler": "TextFoolerJin2019",
@@ -235,6 +244,8 @@ def run_textattack_recipe(
             "skipped": n_skipped,
             "total": n_total,
             "semantic_constraint_backend": semantic_constraint_backend,
+            "requested_device": str(device),
+            "textattack_device": None if ta_utils is None else str(getattr(ta_utils, "device", None)),
         },
     )
 

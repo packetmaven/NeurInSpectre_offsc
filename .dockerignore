@@ -26,6 +26,7 @@ htmlcov/
 data/
 models/
 checkpoints/
+cache/
 results/
 evaluation_results/
 _cli_runs/
@@ -59,6 +60,10 @@ temporary/
 *.html
 *.pdf
 *.pcap
+
+# Large local JSON artifacts (keep source configs under neurinspectre/).
+analysis.json
+*_baseline.json
 
 # Known huge local artifacts
 v1.0-mini.tgz
