@@ -65,12 +65,10 @@ Outputs include:
 
 ```bash
 mkdir -p results
-neurinspectre attack \
-  --model models/cifar10_resnet20_norm_ts.pt \
-  --dataset cifar10 --data-path data/cifar10 \
+neurinspectre analyze \
+  --dataset cifar10 \
   --defense jpeg \
   --epsilon 0.03137254901960784 --norm Linf \
-  --attack-type neurinspectre \
   --iterations 100 \
   --num-samples 1000 \
   --no-report --no-progress \
@@ -166,10 +164,14 @@ bash scripts/reproduce_all.sh
 
 ## Expected Output Format
 
-- `neurinspectre attack` writes an `--output` JSON file.
+- `neurinspectre analyze` / `neurinspectre attack` write an `--output` JSON file.
 - `neurinspectre evaluate` / `neurinspectre table2` write `summary.json` to the output directory.
 - `neurinspectre doctor --as-json` prints a structured JSON inventory (env + deps + GPU + package hash).
 
 ## Artifact Hash
 
-SHA256: TBD (computed at camera-ready)
+To compute a SHA256 for a deterministic source tarball of the current commit:
+
+```bash
+bash scripts/make_artifact_tarball.sh
+```
