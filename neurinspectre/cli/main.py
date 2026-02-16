@@ -1033,12 +1033,30 @@ def main() -> None:
     try:
         argv = sys.argv[1:]
         if argv and argv[0] not in _CLICK_COMMANDS and argv[0] not in {"-h", "--help", "--version"}:
+            # AE/ops ergonomics: NeurInSpectre ships a large legacy argparse CLI
+            # (`neurinspectre.cli.__main__`) for several extended modules that are
+            # not yet ported to Click. For a small, explicit allowlist we delegate
+            # automatically (no env var required) so copy/paste reproduction commands
+            # work out of the box.
+            legacy_allowlist = {
+                # Argument names as users actually type them
+                "gradient-inversion",
+                "gradient_inversion",
+                "rl-obfuscation",
+                "attention-security",
+                "adversarial-ednn",
+                "statistical_evasion",
+                "statistical-evasion",
+                # Debug/infra helpers in legacy CLI
+                "gpu",
+                "obfuscated-gradient",
+            }
             enable_legacy = str(os.environ.get("NEURINSPECTRE_ENABLE_LEGACY_CLI", "")).lower() in {
                 "1",
                 "true",
                 "yes",
             }
-            if enable_legacy:
+            if enable_legacy or argv[0] in legacy_allowlist:
                 from .__main__ import main as legacy_main
 
                 legacy_main()

@@ -10,7 +10,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_CLICK_COMMANDS = {"attack", "characterize", "evaluate", "config"}
+# Commands implemented in the Click CLI entrypoint (`neurinspectre.cli.main`).
+# The legacy argparse CLI delegates these to Click to keep behavior consistent
+# regardless of which console-script entrypoint is used.
+_CLICK_COMMANDS = {
+    "attack",
+    "characterize",
+    "defense-analyzer",
+    "doctor",
+    "evaluate",
+    "table2",
+    "table2-smoke",
+    "compare",
+    "config",
+}
 
 class _NeurInSpectreArgumentParser(argparse.ArgumentParser):
     """ArgumentParser with friendlier diagnostics for common copy/paste errors."""

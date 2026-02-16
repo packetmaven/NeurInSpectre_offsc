@@ -293,6 +293,7 @@ adversarial_robustness_toolbox/
 # Exclude all markdown documentation except essential READMEs
 *.md
 !README.md
+!REPRODUCE.md
 !LICENSE.md
 !docs/guides/*.md
 !docs/research/*.md
