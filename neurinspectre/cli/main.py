@@ -36,6 +36,7 @@ _CLICK_COMMANDS = {
     "defense-analyzer",
     "doctor",
     "evaluate",
+    "figures",
     "table2",
     "table2-smoke",
     "compare",
@@ -145,6 +146,7 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
             "at_transform",
             "spatial_smoothing",
             "random_pad_crop",
+            "rl_obfuscation",
             "certified_defense",
             "custom",
         ]
@@ -160,10 +162,48 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
 @click.option(
     "--attack-type",
     type=click.Choice(
-        ["neurinspectre", "pgd", "apgd", "autoattack", "square", "fab", "bpda", "eot"]
+        [
+            "neurinspectre",
+            "pgd",
+            "apgd",
+            "autoattack",
+            "square",
+            "fab",
+            "bpda",
+            "eot",
+            "hybrid",
+            "hybrid-volterra",
+            "mapgd",
+        ]
     ),
     default="neurinspectre",
     help="Attack algorithm (default: neurinspectre adaptive)",
+)
+@click.option(
+    "--volterra-mode",
+    type=click.Choice(["auto", "on", "off"]),
+    default="auto",
+    show_default=True,
+    help="Volterra memory usage for adaptive attack (auto=characterization driven)",
+)
+@click.option(
+    "--volterra-kernel",
+    type=click.Choice(["power_law", "exponential", "uniform"]),
+    default="power_law",
+    show_default=True,
+    help="Volterra kernel family (used when volterra-mode != off)",
+)
+@click.option(
+    "--volterra-alpha",
+    type=float,
+    default=None,
+    help="Override alpha_volterra (otherwise use characterization-recommended value)",
+)
+@click.option(
+    "--volterra-memory-length",
+    type=int,
+    default=None,
+    help="Override memory length k (otherwise use characterization-recommended value)",
 )
 @click.option(
     "--epsilon",
@@ -919,6 +959,19 @@ def compare_cmd(ctx: click.Context, **kwargs) -> None:
     default="cuda",
     help="Device for computation",
 )
+@click.option(
+    "--seeds",
+    multiple=True,
+    type=int,
+    help="Run 3-5 independent seeds and report mean ± std (repeat flag)",
+)
+@click.option(
+    "--num-seeds",
+    type=int,
+    default=1,
+    show_default=True,
+    help="If >1 and --seeds not set: use [seed, seed+1, ...] from config seed",
+)
 @click.pass_context
 def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
     """
@@ -1085,6 +1138,19 @@ def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
     type=click.Choice(["cuda", "cpu", "mps", "auto"]),
     default="auto",
     help="Device for computation",
+)
+@click.option(
+    "--seeds",
+    multiple=True,
+    type=int,
+    help="Run 3-5 independent seeds and report mean ± std (repeat flag)",
+)
+@click.option(
+    "--num-seeds",
+    type=int,
+    default=1,
+    show_default=True,
+    help="If >1 and --seeds not set: use [seed, seed+1, ...] from config seed",
 )
 @click.pass_context
 def table2_cmd(ctx: click.Context, **kwargs) -> None:
@@ -1277,6 +1343,11 @@ def config_cmd(config_type: str, output: str | None) -> None:
 from .baselines_cmd import baselines_cmd as baselines_cli_cmd  # noqa: E402
 
 cli.add_command(baselines_cli_cmd)
+
+# Paper figure generation (Issue: paper figures -> reproducible CLI).
+from .figures_cmd import figures_cmd as figures_cli_cmd  # noqa: E402
+
+cli.add_command(figures_cli_cmd)
 
 
 def main() -> None:

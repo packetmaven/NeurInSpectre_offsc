@@ -11,8 +11,10 @@ values must be supplied via external files (see: `baseline_validation` config or
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -71,6 +73,149 @@ DEFAULT_PARALLEL_WORKERS = 1  # Conservative default (user must opt-in)
 RECOMMENDED_MAX_WORKERS = 4   # Balances GPU memory vs throughput
 
 
+def _resolve_seed_list(config: Dict[str, Any], *, cli_seeds: Any, num_seeds: Any) -> List[int]:
+    """
+    Statistical rigor (Issue 8): allow evaluation replication across multiple seeds.
+
+    Priority:
+      1) CLI --seeds (repeat flag)
+      2) config.seeds: [..]
+      3) config.seed (+ optional --num-seeds > 1)
+    """
+    if cli_seeds:
+        return [int(s) for s in list(cli_seeds)]
+    cfg_seeds = config.get("seeds")
+    if isinstance(cfg_seeds, (list, tuple)) and cfg_seeds:
+        return [int(s) for s in cfg_seeds]
+
+    base = int(config.get("seed", 42))
+    try:
+        n = int(num_seeds or 1)
+    except Exception:
+        n = 1
+    if n <= 1:
+        return [base]
+    return [base + i for i in range(n)]
+
+
+def _mean_std(values: List[Any]) -> Tuple[float, float, int]:
+    vals: List[float] = []
+    for v in values:
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if not math.isfinite(fv):
+            continue
+        vals.append(fv)
+    n = int(len(vals))
+    if n == 0:
+        return 0.0, 0.0, 0
+    mean = float(sum(vals) / n)
+    if n == 1:
+        return mean, 0.0, 1
+    var = float(sum((x - mean) ** 2 for x in vals) / float(n - 1))
+    return mean, float(math.sqrt(max(0.0, var))), n
+
+
+def _aggregate_pair_metrics(per_seed: List[Dict[str, Any]], *, seeds: List[int]) -> Dict[str, Any]:
+    """
+    Aggregate a single (defense, attack) metrics dict across seeds.
+
+    We keep the mean in the original key (for compatibility with compare/ranking),
+    and add *_std and *_n keys alongside it.
+    """
+    out: Dict[str, Any] = {}
+    for key in ("attack_success_rate", "robust_accuracy", "clean_accuracy", "correct_samples", "samples"):
+        vals = []
+        for m in per_seed:
+            if not isinstance(m, dict):
+                continue
+            if key in m:
+                vals.append(m.get(key))
+        mean, std, n = _mean_std(vals)
+        out[key] = float(mean)
+        out[f"{key}_std"] = float(std)
+        out[f"{key}_n"] = int(n)
+
+    # For auditability: include the ASR per seed.
+    seed_asr: Dict[str, float] = {}
+    for seed, m in zip(seeds, per_seed):
+        if isinstance(m, dict) and "attack_success_rate" in m:
+            try:
+                seed_asr[str(seed)] = float(m.get("attack_success_rate", 0.0))
+            except Exception:
+                seed_asr[str(seed)] = 0.0
+    out["attack_success_rate_by_seed"] = seed_asr
+    return out
+
+
+def _aggregate_results_across_seeds(
+    seed_summaries: List[Dict[str, Any]],
+    *,
+    seeds: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    Aggregate evaluate/table2 results across multiple per-seed runs.
+    """
+    per_seed_maps: List[Dict[Tuple[str, str, str], Dict[str, Any]]] = []
+    for summary in seed_summaries:
+        m: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for res in summary.get("results", []) or []:
+            if not isinstance(res, dict):
+                continue
+            key = (
+                str(res.get("defense", res.get("type", "defense"))),
+                str(res.get("type", res.get("defense", "defense"))),
+                str(res.get("dataset", "")),
+            )
+            m[key] = res
+        per_seed_maps.append(m)
+
+    all_keys = sorted({k for m in per_seed_maps for k in m.keys()})
+    aggregated: List[Dict[str, Any]] = []
+
+    for key in all_keys:
+        base = None
+        for m in per_seed_maps:
+            if key in m:
+                base = m[key]
+                break
+        if base is None:
+            continue
+
+        defense_name = str(base.get("defense", base.get("type", "defense")))
+        defense_type = str(base.get("type", defense_name))
+        dataset_name = str(base.get("dataset", ""))
+
+        attack_names = sorted(
+            {
+                str(a)
+                for m in per_seed_maps
+                for a in (m.get(key, {}).get("attacks", {}) or {}).keys()
+            }
+        )
+        attacks_out: Dict[str, Any] = {}
+        for attack in attack_names:
+            per_seed_metrics: List[Dict[str, Any]] = []
+            for m in per_seed_maps:
+                metrics = (m.get(key, {}).get("attacks", {}) or {}).get(attack, {})
+                per_seed_metrics.append(metrics if isinstance(metrics, dict) else {})
+            attacks_out[attack] = _aggregate_pair_metrics(per_seed_metrics, seeds=seeds)
+
+        aggregated.append(
+            {
+                "defense": defense_name,
+                "type": defense_type,
+                "dataset": dataset_name,
+                "attacks": attacks_out,
+                "multi_seed": {"enabled": True, "seeds": list(seeds), "n_seeds": int(len(seeds))},
+            }
+        )
+
+    return aggregated
+
+
 def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
     cmd_verbose = int(kwargs.get("verbose", 0) or 0)
     if ctx is not None:
@@ -109,7 +254,99 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
     resume = bool(kwargs.get("resume", False))
     summary_only = bool(kwargs.get("summary_only", False))
 
-    seed = int(config.get("seed", 42))
+    # -------------------------------------------------------------------
+    # Issue 8: multi-seed replication (mean ± std)
+    # -------------------------------------------------------------------
+    seed_override = kwargs.get("_seed_override", None)
+    if seed_override is not None:
+        seeds = [int(seed_override)]
+    else:
+        seeds = _resolve_seed_list(config, cli_seeds=kwargs.get("seeds"), num_seeds=kwargs.get("num_seeds"))
+
+    # Multi-seed orchestrator: run each seed in a subdirectory, then aggregate.
+    if seed_override is None and len(seeds) > 1:
+        seed_summaries: List[Dict[str, Any]] = []
+        seed_paths: Dict[str, str] = {}
+
+        # Keep per-seed runs quiet; we render a single aggregated report at the end.
+        for s in seeds:
+            seed_dir = out_dir / f"seed_{int(s)}"
+            seed_dir.mkdir(parents=True, exist_ok=True)
+            seed_paths[str(int(s))] = str(seed_dir / "summary.json")
+
+            child_kwargs = dict(kwargs)
+            child_kwargs["_seed_override"] = int(s)
+            child_kwargs["output_dir"] = str(seed_dir)
+            child_kwargs["report"] = False
+            child_kwargs["json_output"] = None
+            child_kwargs["sarif_output"] = None
+            child_kwargs["seeds"] = ()
+            child_kwargs["num_seeds"] = 1
+            run_evaluation(ctx, **child_kwargs)
+
+            seed_summary = _load_json(seed_dir / "summary.json")
+            seed_summaries.append(seed_summary)
+
+        aggregated_results = _aggregate_results_across_seeds(seed_summaries, seeds=[int(s) for s in seeds])
+        summary = {
+            "config": {**copy.deepcopy(config), "seeds": [int(s) for s in seeds]},
+            "results": aggregated_results,
+            "multi_seed": {
+                "enabled": True,
+                "seeds": [int(s) for s in seeds],
+                "num_seeds": int(len(seeds)),
+                "seed_summaries": seed_paths,
+            },
+            "timing": {
+                "total_seconds": float(sum(float(ss.get("timing", {}).get("total_seconds", 0.0)) for ss in seed_summaries)),
+                "defenses": len(aggregated_results),
+            },
+        }
+        summary["highlights"] = _summarize_evaluation_findings(aggregated_results, config=config)
+        baseline_report = _run_baseline_validation(
+            aggregated_results,
+            config=config,
+            config_path=config_path,
+        )
+        summary["baseline_validation"] = baseline_report
+        save_json(summary, out_dir / "summary.json")
+        click.echo(f"Evaluation summary written to {out_dir / 'summary.json'}")
+
+        if baseline_report.get("enabled") and baseline_report.get("strict") and not baseline_report.get("passed", False):
+            raise click.ClickException(
+                "Baseline validation failed: "
+                f"{baseline_report.get('failed_count', 0)} pairs out of tolerance, "
+                f"{baseline_report.get('missing_expected_count', 0)} missing expected pairs."
+            )
+
+        report = bool(kwargs.get("report", True))
+        brief = bool(kwargs.get("brief", False))
+        if report and not quiet:
+            render_evaluation_report(
+                console,
+                results=aggregated_results,
+                config=config,
+                output_dir=str(out_dir),
+                report_format=report_format,
+                brief=brief,
+                summary_only=summary_only,
+            )
+
+        json_output = kwargs.get("json_output")
+        if json_output:
+            export_evaluation_json({"config": summary.get("config", {}), "results": aggregated_results}, json_output)
+            click.echo(f"JSON report written to {json_output}")
+
+        sarif_output = kwargs.get("sarif_output")
+        if sarif_output:
+            export_evaluation_sarif({"pairs": _evaluation_pairs(aggregated_results)}, sarif_output)
+            click.echo(f"SARIF report written to {sarif_output}")
+        return
+
+    # Single-seed path (legacy behavior)
+    seed = int(seeds[0]) if seeds else int(config.get("seed", 42))
+    config["seed"] = seed
+    config.pop("seeds", None)
     set_seed(seed)
 
     defenses = _normalize_defenses(config.get("defenses", []))

@@ -4,6 +4,7 @@ Unified AttackFactory for standardized attack creation and execution.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -18,8 +19,10 @@ from .bpda import BPDA
 from .eot import EOT, AdaptiveEOT
 from .ma_pgd import MAPGD
 from .autoattack import AutoAttack
-from .hybrid import HybridBPDAEOT
+from .hybrid import HybridBPDAEOT, HybridBPDAEOTVolterra
 from ..characterization.defense_analyzer import DefenseAnalyzer, ObfuscationType
+
+logger = logging.getLogger(__name__)
 
 
 class LossFunction(Enum):
@@ -174,6 +177,8 @@ class AttackFactory:
             return _EOTAttackRunner(model, cfg, defense=defense, device=device, raw_config=config)
         if attack_type == "hybrid":
             return _HybridAttackRunner(model, cfg, defense=defense, device=device, raw_config=config)
+        if attack_type in {"hybrid_volterra", "hybrid-volterra"}:
+            return _HybridVolterraAttackRunner(model, cfg, defense=defense, device=device, raw_config=config)
         if attack_type == "neurinspectre":
             return _NeurInSpectreRunner(
                 model,
@@ -548,6 +553,55 @@ class _HybridAttackRunner(_BaseRunner):
         return AttackResult(x_adv=x_adv, predictions=preds, success_mask=success, metadata={})
 
 
+class _HybridVolterraAttackRunner(_BaseRunner):
+    def __init__(
+        self,
+        model,
+        cfg: AttackConfig,
+        defense=None,
+        device: str = "cpu",
+        raw_config: Optional[Dict[str, Any]] = None,
+    ):
+        raw_config = raw_config or {}
+        defense = _resolve_defense(model, defense)
+        if defense is None:
+            raise ValueError("Hybrid-Volterra attack requires a defense wrapper with transform()")
+        base_model = _resolve_base_model(model, defense)
+
+        alpha_volterra = raw_config.get("alpha_volterra")
+        memory_length = raw_config.get("memory_length")
+        if alpha_volterra is None or memory_length is None:
+            raise ValueError(
+                "hybrid-volterra requires --volterra-alpha and --volterra-memory-length "
+                "(or config keys alpha_volterra/memory_length)."
+            )
+
+        kernel_type = raw_config.get("volterra_kernel", raw_config.get("kernel", "power_law"))
+        alpha = float(cfg.step_size) if cfg.step_size is not None else 2 / 255
+        attack = HybridBPDAEOTVolterra(
+            base_model,
+            defense,
+            approx_fn=_resolve_bpda_approximation(defense, cfg),
+            num_samples=int(raw_config.get("eot_samples", cfg.eot_samples)),
+            importance_sampling=cfg.eot_importance_weighted,
+            eps=cfg.epsilon,
+            alpha=alpha,
+            steps=cfg.n_iterations,
+            norm=cfg.norm,
+            alpha_volterra=float(alpha_volterra),
+            memory_length=int(memory_length),
+            kernel_type=str(kernel_type),
+            device=device,
+        )
+        super().__init__(base_model, attack, eval_model=defense)
+
+    def run(self, x: torch.Tensor, y: torch.Tensor) -> AttackResult:
+        x_adv = self.attack(x, y)
+        preds = self._predict(x_adv)
+        success = preds != y
+        return AttackResult(x_adv=x_adv, predictions=preds, success_mask=success, metadata={})
+
+
 class _NeurInSpectreRunner(_BaseRunner):
     def __init__(
         self,
@@ -587,10 +641,57 @@ class _NeurInSpectreRunner(_BaseRunner):
         requires_eot = getattr(char, "requires_eot", False) if char is not None else False
         requires_mapgd = getattr(char, "requires_mapgd", False) if char is not None else False
 
+        # Volterra/memory gating:
+        # - "auto": use when characterization recommends MA-PGD / memory.
+        # - "on": force-enable memory (best-effort fallbacks if no characterization).
+        # - "off": never use memory.
+        volterra_mode = str(raw_config.get("volterra_mode", "auto")).lower().strip()
+        if volterra_mode not in {"auto", "on", "off"}:
+            volterra_mode = "auto"
+        use_volterra = volterra_mode == "on" or (volterra_mode == "auto" and bool(requires_mapgd))
+
         if ObfuscationType.VANISHING in obf_types:
             cfg.loss = LossFunction.LOGIT_MARGIN
 
         if requires_bpda and requires_eot:
+            if use_volterra and defense is not None:
+                alpha_volterra = raw_config.get("alpha_volterra")
+                if alpha_volterra is None and char is not None:
+                    alpha_volterra = getattr(char, "alpha_volterra", None)
+                if alpha_volterra is None:
+                    alpha_volterra = 0.5
+
+                memory_length = raw_config.get("memory_length")
+                if memory_length is None and char is not None:
+                    memory_length = getattr(char, "recommended_memory_length", None)
+                if memory_length is None:
+                    memory_length = 20
+
+                kernel_type = raw_config.get("volterra_kernel", raw_config.get("kernel", "power_law"))
+                logger.info(
+                    "[NeurInSpectre] Selected attack: HybridBPDAEOTVolterra "
+                    "(BPDA+EOT+Volterra) mode=%s alpha=%s k=%s kernel=%s",
+                    volterra_mode,
+                    f"{float(alpha_volterra):.3f}" if alpha_volterra is not None else "n/a",
+                    int(memory_length),
+                    str(kernel_type),
+                )
+                return HybridBPDAEOTVolterra(
+                    _resolve_base_model(model, defense),
+                    defense,
+                    approx_fn=_resolve_bpda_approximation(defense, cfg),
+                    num_samples=int(raw_config.get("eot_samples", cfg.eot_samples)),
+                    importance_sampling=cfg.eot_importance_weighted,
+                    eps=cfg.epsilon,
+                    alpha=float(cfg.step_size) if cfg.step_size is not None else 2 / 255,
+                    steps=cfg.n_iterations,
+                    norm=cfg.norm,
+                    alpha_volterra=float(alpha_volterra),
+                    memory_length=int(memory_length),
+                    kernel_type=str(kernel_type),
+                    device=device,
+                )
+            logger.info("[NeurInSpectre] Selected attack: HybridBPDAEOT (BPDA+EOT) mode=%s", volterra_mode)
             return HybridBPDAEOT(
                 _resolve_base_model(model, defense),
                 defense,
@@ -626,7 +727,8 @@ class _NeurInSpectreRunner(_BaseRunner):
                 norm=cfg.norm,
                 device=device,
             )
-        if requires_mapgd:
+        if requires_mapgd and use_volterra:
+            logger.info("[NeurInSpectre] Selected attack: MA-PGD (Volterra memory) mode=%s", volterra_mode)
             return MAPGD(
                 model,
                 eps=cfg.epsilon,

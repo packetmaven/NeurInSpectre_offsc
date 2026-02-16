@@ -466,6 +466,83 @@ class RandomNoiseDefense(DefenseWrapper):
         return self.noise_bpda
 
 
+class RLObfuscationDefense(DefenseWrapper):
+    """
+    Stateful, temporally correlated obfuscation defense (RL-style).
+
+    This wrapper is intentionally lightweight: it is meant for *decisive*
+    Volterra-memory experiments (Issue 6) and for exercising the
+    `ObfuscationType.RL_TRAINED` characterization path on real datasets.
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        *,
+        bits: int = 6,
+        std: float = 0.08,
+        alpha: float = 0.60,
+        n_samples: int = 32,
+        device: str = "cuda",
+    ):
+        spec = DefenseSpec(
+            name="rl_obfuscation",
+            domain="vision",
+            obfuscation_types=[ObfuscationType.SHATTERED, ObfuscationType.STOCHASTIC, ObfuscationType.RL_TRAINED],
+            params={
+                "bits": int(bits),
+                "std": float(std),
+                "alpha": float(alpha),
+                "n_samples": int(n_samples),
+            },
+            requires_bpda=True,
+            bpda_approximation="identity",
+            is_stochastic=True,
+            eot_samples=20,
+        )
+        super().__init__(base_model, spec, device)
+
+        self.bits = int(bits)
+        self.std = float(std)
+        self.alpha = float(alpha)
+        self.n_samples = int(n_samples)
+
+        # Use a straight-through estimator so gradients remain measurable for
+        # characterization (Volterra/autocorr). The attack still uses BPDA+EOT.
+        self._quant = BitDepthReduction(bits=self.bits, differentiable=True)
+        self._quant_bpda = self._quant.get_bpda_approximation()
+
+        # Internal state to induce temporal correlation (Volterra signature).
+        self._prev_noise: Optional[torch.Tensor] = None
+
+    def reset_state(self) -> None:
+        self._prev_noise = None
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        x_q = self._quant(x)
+        noise = torch.randn_like(x_q) * self.std
+        if self._prev_noise is not None and self._prev_noise.shape == noise.shape:
+            noise = self.alpha * self._prev_noise + (1.0 - self.alpha) * noise
+        self._prev_noise = noise.detach()
+        return torch.clamp(x_q + noise, 0.0, 1.0)
+
+    def get_bpda_approximation(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        # Deterministic approximation (no stochastic noise) for BPDA.
+        return self._quant_bpda
+
+    def forward(self, x: torch.Tensor, use_approximation: bool = False) -> torch.Tensor:
+        # Similar to randomized smoothing: average logits at eval-time to preserve
+        # clean accuracy under high noise, but keep a single-sample path when
+        # EOT is explicitly enabled.
+        if self._eot_enabled:
+            return self.base_model(self.transform(x))
+        logits_acc = None
+        for _ in range(self.n_samples):
+            logits = self.base_model(self.transform(x))
+            logits_acc = logits if logits_acc is None else logits_acc + logits
+        return logits_acc / float(max(1, self.n_samples))
+
+
 class EnsembleDiversityDefense(DefenseWrapper):
     def __init__(self, models: List[nn.Module], aggregation: str = "average", device: str = "cuda"):
         spec = DefenseSpec(

@@ -19,6 +19,7 @@ from .wrappers import (
     FeatureSqueezingDefense,
     GradientRegularizationDefense,
     JPEGCompressionDefense,
+    RLObfuscationDefense,
     RandomizedSmoothingDefense,
     RandomNoiseDefense,
     RandomPadCropDefense,
@@ -78,6 +79,15 @@ class DefenseFactory:
             return CertifiedDefense(base_model, sigma=sigma, device=device)
         if key == "random_noise":
             return RandomNoiseDefense(base_model, std=float(params.get("std", 0.05)), device=device)
+        if key == "rl_obfuscation":
+            return RLObfuscationDefense(
+                base_model,
+                bits=int(params.get("bits", 6)),
+                std=float(params.get("std", 0.08)),
+                alpha=float(params.get("alpha", 0.60)),
+                n_samples=int(params.get("n_samples", 32)),
+                device=device,
+            )
         if key == "total_variation":
             return TotalVariationDefense(
                 base_model,

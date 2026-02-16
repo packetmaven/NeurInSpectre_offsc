@@ -110,19 +110,88 @@ def run_textattack_recipe(
             "Only dataset='sst2' is supported by this baseline wrapper for now."
         )
 
-    # TextAttack expects the `glue` dataset for SST2.
-    ta_dataset = textattack.datasets.HuggingFaceDataset(
-        "glue",
-        "sst2",
-        split=hf_split,
-        shuffle=True,
-    )
-    # Restrict to N examples deterministically (TextAttack shuffles).
+    # Deterministically select a subset of SST-2 examples.
+    #
+    # TextAttack's HuggingFaceDataset wrapper does not consistently expose a
+    # `.take(...)` helper across versions. Instead, we use the underlying HF
+    # datasets object and then wrap it.
     num_examples = int(max(1, num_examples))
-    ta_dataset = ta_dataset.take(num_examples)
+    try:
+        import datasets as hf_datasets  # type: ignore
+    except Exception:
+        hf_datasets = None
+
+    if hf_datasets is not None:
+        hf = hf_datasets.load_dataset("glue", "sst2", split=hf_split)
+        hf = hf.shuffle(seed=int(seed))
+        n_take = int(min(len(hf), num_examples))
+        hf = hf.select(range(n_take))
+        ta_dataset = textattack.datasets.HuggingFaceDataset(hf, shuffle=False)
+        num_examples = n_take
+    else:
+        # Fallback: let TextAttack load the dataset, then subset the internal
+        # `_dataset` if present.
+        ta_dataset = textattack.datasets.HuggingFaceDataset(
+            "glue",
+            "sst2",
+            split=hf_split,
+            shuffle=True,
+        )
+        n_take = int(min(len(ta_dataset), num_examples))
+        if hasattr(ta_dataset, "_dataset") and hasattr(getattr(ta_dataset, "_dataset"), "select"):
+            ta_dataset._dataset = ta_dataset._dataset.select(range(n_take))  # type: ignore[attr-defined]
+        else:
+            subset = [ta_dataset[i] for i in range(n_take)]
+            ta_dataset = textattack.datasets.Dataset(subset, shuffle=False)
+        num_examples = n_take
 
     recipe_cls = getattr(textattack.attack_recipes, recipe_cls_name)
     attack = recipe_cls.build(model_wrapper)
+
+    # TextAttack's canonical TextFooler/BAE/BERT-Attack recipes use the
+    # Universal Sentence Encoder constraint, which depends on tensorflow_hub.
+    # On many PyTorch-only setups (especially macOS), tensorflow is intentionally
+    # absent. To keep the baseline runnable while preserving a semantic-similarity
+    # constraint, fall back to TextAttack's SBERT constraint when tfhub is missing.
+    semantic_constraint_backend = "none"
+    if hasattr(attack, "constraints") and isinstance(getattr(attack, "constraints"), list):
+        has_use = any(c.__class__.__name__ == "UniversalSentenceEncoder" for c in attack.constraints)
+        if has_use:
+            semantic_constraint_backend = "use"
+            try:
+                import tensorflow_hub  # type: ignore  # noqa: F401
+            except Exception:
+                try:
+                    from textattack.constraints.semantics.sentence_encoders.sentence_bert import SBERT
+
+                    new_constraints = []
+                    for c in attack.constraints:
+                        if c.__class__.__name__ != "UniversalSentenceEncoder":
+                            new_constraints.append(c)
+                            continue
+                        thr = float(getattr(c, "threshold", 0.8))
+                        thr = float(max(-1.0, min(1.0, thr)))
+                        new_constraints.append(
+                            SBERT(
+                                threshold=thr,
+                                metric="cosine",
+                                compare_against_original=bool(getattr(c, "compare_against_original", True)),
+                                window_size=getattr(c, "window_size", None),
+                                skip_text_shorter_than_window=bool(
+                                    getattr(c, "skip_text_shorter_than_window", False)
+                                ),
+                                # Small, widely available SBERT model (faster than BERT-base).
+                                model_name="all-MiniLM-L6-v2",
+                            )
+                        )
+                    attack.constraints = new_constraints
+                    semantic_constraint_backend = "sbert"
+                except Exception:
+                    # Last resort: drop USE constraint instead of crashing.
+                    attack.constraints = [
+                        c for c in attack.constraints if c.__class__.__name__ != "UniversalSentenceEncoder"
+                    ]
+                    semantic_constraint_backend = "dropped"
 
     attacker = textattack.Attacker(attack, ta_dataset, textattack.AttackArgs(
         num_examples=num_examples,
@@ -130,19 +199,27 @@ def run_textattack_recipe(
         disable_stdout=True,
         silent=True,
         # Don't write TextAttack's own output files; NeurInSpectre writes JSON itself.
-        log_to_csv=False,
+        log_to_csv=None,
     ))
     results = attacker.attack_dataset()
 
-    # TextAttack returns an iterable of results; compute success rate.
+    # TextAttack returns a list of AttackResult instances, which are typically
+    # subclasses like SuccessfulAttackResult / FailedAttackResult / SkippedAttackResult.
+    #
+    # Some versions do not populate `goal_status`, so count based on class name.
     n_total = 0
     n_succeeded = 0
+    n_failed = 0
+    n_skipped = 0
     for r in results:
         n_total += 1
-        # "Successful" means the attack changed the prediction to an incorrect label.
-        if r and getattr(r, "goal_status", None) is not None:
-            if str(r.goal_status).lower().endswith("succeeded"):
-                n_succeeded += 1
+        tname = type(r).__name__.lower()
+        if "successfulattackresult" in tname or tname.startswith("successful"):
+            n_succeeded += 1
+        elif "failedattackresult" in tname or tname.startswith("failed"):
+            n_failed += 1
+        elif "skippedattackresult" in tname or tname.startswith("skipped"):
+            n_skipped += 1
 
     success_rate = (n_succeeded / n_total) if n_total else None
     return TextAttackRunResult(
@@ -152,6 +229,12 @@ def run_textattack_recipe(
         split=str(hf_split),
         num_examples=int(num_examples),
         success_rate=success_rate,
-        details={"succeeded": n_succeeded, "total": n_total},
+        details={
+            "succeeded": n_succeeded,
+            "failed": n_failed,
+            "skipped": n_skipped,
+            "total": n_total,
+            "semantic_constraint_backend": semantic_constraint_backend,
+        },
     )
 

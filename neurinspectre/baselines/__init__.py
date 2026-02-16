@@ -10,6 +10,7 @@ Policy:
 from __future__ import annotations
 
 __all__ = [
+    "bae",
     "backdoor",
     "gradinversion",
     "prompt_injection",

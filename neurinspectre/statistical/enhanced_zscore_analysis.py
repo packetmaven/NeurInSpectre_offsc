@@ -16,7 +16,7 @@ from scipy.spatial.distance import mahalanobis
 from scipy.linalg import inv, LinAlgError
 from sklearn.covariance import EmpiricalCovariance, MinCovDet
 from sklearn.preprocessing import StandardScaler
-from typing import Dict, Tuple, Optional, Union
+from typing import Any, Dict, Tuple, Optional, Union
 from dataclasses import dataclass
 from collections import deque
 import logging
@@ -32,9 +32,13 @@ class ZScoreResults:
     robust_zscores: np.ndarray
     temporal_zscores: np.ndarray
     anomaly_flags: np.ndarray
-    confidence_intervals: Dict[str, Tuple[float, float]]
-    statistical_significance: Dict[str, float]
+    confidence_intervals: Dict[str, Any]
+    statistical_significance: Dict[str, Any]
     feature_contributions: np.ndarray
+    # Sample-size metadata (Issue 8: statistical rigor)
+    n_samples: int = 0
+    n_features: int = 0
+    n_finite: int = 0
 
 class EnhancedZScoreAnalyzer:
     """
@@ -327,7 +331,7 @@ class EnhancedZScoreAnalyzer:
         
         return anomalies
     
-    def compute_confidence_intervals(self, z_scores: np.ndarray) -> Dict[str, Tuple[float, float]]:
+    def compute_confidence_intervals(self, z_scores: np.ndarray) -> Dict[str, Any]:
         """
         Compute confidence intervals for Z-scores
         
@@ -352,10 +356,11 @@ class EnhancedZScoreAnalyzer:
         return {
             'mean': (ci_lower, ci_upper),
             'std': (std_z, std_z),  # Standard deviation doesn't have CI in same sense
-            'range': (np.min(z_scores), np.max(z_scores))
+            'range': (np.min(z_scores), np.max(z_scores)),
+            'n': int(n),
         }
     
-    def test_statistical_significance(self, z_scores: np.ndarray, null_mean: float = 0.0) -> Dict[str, float]:
+    def test_statistical_significance(self, z_scores: np.ndarray, null_mean: float = 0.0) -> Dict[str, Any]:
         """
         Test statistical significance of Z-scores
         
@@ -368,7 +373,8 @@ class EnhancedZScoreAnalyzer:
         """
         z = np.asarray(z_scores, dtype=np.float64)
         z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-        if z.size < 2 or float(np.std(z)) < 1e-12:
+        n = int(z.size)
+        if n < 2 or float(np.std(z)) < 1e-12:
             # Degenerate input: tests are not informative; report a safe, non-NaN structure.
             return {
                 't_statistic': 0.0,
@@ -377,6 +383,8 @@ class EnhancedZScoreAnalyzer:
                 'ks_p_value': 1.0,
                 'shapiro_statistic': 0.0,
                 'shapiro_p_value': 1.0,
+                'n': int(n),
+                'null_mean': float(null_mean),
             }
 
         with warnings.catch_warnings():
@@ -411,6 +419,8 @@ class EnhancedZScoreAnalyzer:
             'ks_p_value': float(ks_p_value),
             'shapiro_statistic': float(sw_stat),
             'shapiro_p_value': float(sw_p_value),
+            'n': int(n),
+            'null_mean': float(null_mean),
         }
     
     def analyze(
@@ -430,7 +440,20 @@ class EnhancedZScoreAnalyzer:
         Returns:
             ZScoreResults object or simple anomaly flags
         """
+        X = np.asarray(X)
         logger.info(f"Starting comprehensive Z-score analysis on data shape: {X.shape}")
+        n_samples = int(X.shape[0]) if X.ndim >= 1 else 0
+        n_features = int(X.shape[1]) if X.ndim == 2 else 1
+        if n_samples:
+            Xf = np.asarray(X, dtype=np.float64)
+            if Xf.ndim == 1:
+                n_finite = int(np.isfinite(Xf).sum())
+            elif Xf.ndim == 2:
+                n_finite = int(np.isfinite(Xf).all(axis=1).sum())
+            else:
+                n_finite = int(np.isfinite(Xf.reshape(n_samples, -1)).all(axis=1).sum())
+        else:
+            n_finite = 0
         
         # Compute all types of Z-scores
         univariate_z = self.compute_univariate_zscores(X)
@@ -461,7 +484,10 @@ class EnhancedZScoreAnalyzer:
             anomaly_flags=anomaly_flags,
             confidence_intervals=confidence_intervals,
             statistical_significance=statistical_significance,
-            feature_contributions=feature_contributions
+            feature_contributions=feature_contributions,
+            n_samples=n_samples,
+            n_features=n_features,
+            n_finite=n_finite,
         )
         
         logger.info(f"Analysis complete. Detected {np.sum(anomaly_flags)} anomalies out of {len(anomaly_flags)} samples")

@@ -807,6 +807,7 @@ def build_defense(
         "random_pad_crop": "random_pad_crop",
         "random_padcrop": "random_pad_crop",
         "random_noise": "random_noise",
+        "rl_obfuscation": "rl_obfuscation",
         "total_variation": "total_variation",
     }
     if key == "custom":

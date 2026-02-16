@@ -88,6 +88,8 @@ def _normalize_table2_spec(
 
     cfg: Dict[str, Any] = {}
     cfg["seed"] = int(raw.get("seed", 42))
+    if isinstance(raw.get("seeds"), (list, tuple)) and raw.get("seeds"):
+        cfg["seeds"] = [int(s) for s in list(raw.get("seeds") or [])]
     cfg["attack_batch_size"] = int(raw.get("attack_batch_size", eval_defaults.get("batch_size", 128)))
     cfg["cache"] = dict(raw.get("cache", {}) or {})
     cfg["strict_dataset_budgets"] = bool(strict_dataset_budgets)
@@ -268,6 +270,8 @@ def run_table2(ctx: click.Context, **kwargs: Any) -> None:
         parallel=int(kwargs.get("parallel", 1)),
         resume=bool(kwargs.get("resume", False)),
         device=str(kwargs.get("device", "auto")),
+        seeds=tuple(kwargs.get("seeds") or ()),
+        num_seeds=int(kwargs.get("num_seeds", 1)),
     )
 
 
@@ -283,6 +287,8 @@ def _normalize_table2_config(
     evaluation_cfg = dict(raw.get("evaluation", {}) or {})
 
     cfg["seed"] = int(raw.get("seed", 42))
+    if isinstance(raw.get("seeds"), (list, tuple)) and raw.get("seeds"):
+        cfg["seeds"] = [int(s) for s in list(raw.get("seeds") or [])]
     cfg["attack_batch_size"] = int(raw.get("attack_batch_size", evaluation_cfg.get("batch_size", 128)))
     cfg["cache"] = dict(raw.get("cache", {}) or {})
     cfg["datasets"] = _normalize_datasets(dict(raw.get("datasets", {}) or {}))

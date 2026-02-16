@@ -466,7 +466,14 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
         "batch_size": batch_size,
         "seed": seed,
         "targeted": targeted,
+        # Volterra memory control (Issue 6: decisive experiment plumbing)
+        "volterra_mode": str(kwargs.get("volterra_mode", "auto")),
+        "volterra_kernel": str(kwargs.get("volterra_kernel", "power_law")),
     }
+    if kwargs.get("volterra_alpha") is not None:
+        attack_config["alpha_volterra"] = float(kwargs["volterra_alpha"])
+    if kwargs.get("volterra_memory_length") is not None:
+        attack_config["memory_length"] = int(kwargs["volterra_memory_length"])
 
     # -------------------------------------------------------------------
     # 3. Build console and progress
@@ -592,6 +599,12 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
 
     elapsed = time.time() - start_time
 
+    selected_attack_impl = None
+    try:
+        selected_attack_impl = runner.attack.__class__.__name__  # type: ignore[attr-defined]
+    except Exception:
+        selected_attack_impl = None
+
     # -------------------------------------------------------------------
     # 5. Extract final characterization (if available)
     # -------------------------------------------------------------------
@@ -617,6 +630,7 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
             "attack_success_rate": attack_success_rate,
             "robust_accuracy": summary.get("robust_accuracy", 0.0),
             "clean_accuracy": summary.get("clean_accuracy", 0.0),
+            "selected_attack_impl": selected_attack_impl,
             "queries": summary.get("queries"),
             "iterations": summary.get("iterations"),
             "samples": summary.get("samples", 0),
@@ -637,6 +651,10 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
             "hybrid_mode": attack_config.get("hybrid_mode", False),
             "use_logit_loss": attack_config.get("use_logit_loss", False),
             "logit_margin": attack_config.get("logit_margin"),
+            "volterra_mode": attack_config.get("volterra_mode"),
+            "volterra_kernel": attack_config.get("volterra_kernel"),
+            "alpha_volterra": attack_config.get("alpha_volterra"),
+            "memory_length": attack_config.get("memory_length"),
         },
         "timing": {
             "total_seconds": float(elapsed),

@@ -21,6 +21,7 @@ _CLICK_COMMANDS = {
     "defense-analyzer",
     "doctor",
     "evaluate",
+    "figures",
     "table2",
     "table2-smoke",
     "compare",
