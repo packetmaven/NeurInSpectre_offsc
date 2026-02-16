@@ -37,6 +37,15 @@ python -m pip install -e ".[dev]"
 neurinspectre doctor
 ```
 
+## Docker (CUDA)
+
+Build and run the CUDA container (requires NVIDIA Container Toolkit on the host):
+
+```bash
+docker build -t neurinspectre:ae .
+docker run --gpus all --rm -it neurinspectre:ae doctor
+```
+
 ## Smoke Test (5 minutes)
 
 For a fast end-to-end check (auto-discovers what is runnable locally):
