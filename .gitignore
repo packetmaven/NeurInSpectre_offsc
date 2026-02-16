@@ -252,8 +252,8 @@ results/
 *.safetensors
 *.bin
 !neurinspectre/**/*.py
-models/
-checkpoints/
+/models/
+/checkpoints/
 data/large_datasets/
 *.model
 *.weights

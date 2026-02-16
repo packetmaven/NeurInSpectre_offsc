@@ -22,6 +22,9 @@ class GradientInversionConfig:
     gradient_loss: str = 'l2'
     tv_weight: float = 0.001
     l2_weight: float = 0.0001
+    # GradInversion-style: optimize multiple reconstructions jointly and penalize disagreement.
+    n_group: int = 1
+    group_consistency_weight: float = 0.0
     input_shape: Tuple[int, ...] = (1, 784)
     num_classes: int = 10
     device: str = 'auto'
@@ -123,78 +126,167 @@ class GradientInversionAttack:
             raise ValueError("real_gradients contained no usable tensors")
         real_gradients = safe_real
         named_params = list(self.model.named_parameters())
+        method = str(self.config.method or "idlg").strip().lower()
+        n_group = int(max(1, self.config.n_group))
+        if method == "gradinversion":
+            # Default to a small group if the caller didn't set it.
+            n_group = int(max(n_group, 4))
+            if self.config.group_consistency_weight <= 0.0:
+                self.config.group_consistency_weight = 1e-2
+        elif method == "dlg":
+            n_group = 1
+        elif method == "idlg":
+            n_group = 1
+        else:
+            logger.warning("Unknown method=%s; falling back to idlg-style reconstruction.", method)
+            method = "idlg"
+            n_group = 1
+
         inferred_label = None
-        if self.config.use_label_inference and self.config.method == 'idlg':
+        if self.config.use_label_inference and method == "idlg":
             inferred_label = self.infer_label_analytical(real_gradients)
-        dummy_data = torch.randn(self.config.input_shape, device=self.device, dtype=self.dtype, generator=self._rng)
-        dummy_data.requires_grad = True
-        if inferred_label is not None:
-            dummy_label = inferred_label.to(self.device)
+
+        def _init_dummy_data() -> torch.Tensor:
+            x = torch.randn(self.config.input_shape, device=self.device, dtype=self.dtype, generator=self._rng)
+            x.requires_grad_(True)
+            return x
+
+        dummy_data_list = [_init_dummy_data() for _ in range(n_group)]
+
+        dummy_label = None
+        dummy_label_logits_list = []
+        if method in {"dlg", "gradinversion"}:
+            # DLG-style: optimize soft labels (batch_size x num_classes).
+            for _ in range(n_group):
+                ll = torch.randn(
+                    (self.config.input_shape[0], int(self.config.num_classes)),
+                    device=self.device,
+                    dtype=self.dtype,
+                    generator=self._rng,
+                    requires_grad=True,
+                )
+                dummy_label_logits_list.append(ll)
         else:
-            logger.info("Label inference unavailable; initializing dummy labels randomly (set config.seed for determinism).")
-            dummy_label = torch.randint(
-                0,
-                self.config.num_classes,
-                (self.config.input_shape[0],),
-                device=self.device,
-                generator=self._rng,
-            )
+            if inferred_label is not None:
+                dummy_label = inferred_label.to(self.device)
+            else:
+                logger.info(
+                    "Label inference unavailable; initializing dummy labels randomly "
+                    "(set config.seed for determinism)."
+                )
+                dummy_label = torch.randint(
+                    0,
+                    self.config.num_classes,
+                    (self.config.input_shape[0],),
+                    device=self.device,
+                    generator=self._rng,
+                )
+
+        params = list(dummy_data_list) + list(dummy_label_logits_list)
         if self.config.optimizer == 'lbfgs':
-            optimizer = torch.optim.LBFGS([dummy_data], lr=self.config.learning_rate, max_iter=20)
+            optimizer = torch.optim.LBFGS(params, lr=self.config.learning_rate, max_iter=20)
         elif self.config.optimizer == 'adam':
-            optimizer = torch.optim.Adam([dummy_data], lr=self.config.learning_rate)
+            optimizer = torch.optim.Adam(params, lr=self.config.learning_rate)
         else:
-            optimizer = torch.optim.SGD([dummy_data], lr=self.config.learning_rate, momentum=0.9)
+            optimizer = torch.optim.SGD(params, lr=self.config.learning_rate, momentum=0.9)
+
         history, best_loss, patience_counter = [], float('inf'), 0
-        best_data = dummy_data.detach().clone()
+        best_data = dummy_data_list[0].detach().clone()
         best_iter = -1
+
         for iteration in range(self.config.max_iterations):
             def closure():
                 optimizer.zero_grad()
-                outputs = self.model(dummy_data)
-                dummy_loss = nn.CrossEntropyLoss()(outputs, dummy_label)
-                dummy_gradients = torch.autograd.grad(
-                    dummy_loss,
-                    [p for _, p in named_params],
-                    create_graph=True,
-                    allow_unused=True,
-                )
-                dummy_grad_dict = {
-                    name: grad
-                    for (name, _), grad in zip(named_params, dummy_gradients)
-                    if grad is not None
-                }
-                grad_loss = self.compute_gradient_loss(dummy_grad_dict, real_gradients)
-                tv_loss = self.total_variation(dummy_data) * self.config.tv_weight
-                l2_loss = (dummy_data ** 2).sum() * self.config.l2_weight
-                total_loss = grad_loss + tv_loss + l2_loss
+
+                grad_losses = []
+                tv_losses = []
+                l2_losses = []
+
+                for gi, dummy_data in enumerate(dummy_data_list):
+                    outputs = self.model(dummy_data)
+
+                    if dummy_label_logits_list:
+                        p = torch.softmax(dummy_label_logits_list[gi], dim=1)
+                        logp = torch.log_softmax(outputs, dim=1)
+                        dummy_loss = -(p * logp).sum(dim=1).mean()
+                    else:
+                        dummy_loss = nn.CrossEntropyLoss()(outputs, dummy_label)
+
+                    dummy_gradients = torch.autograd.grad(
+                        dummy_loss,
+                        [p for _, p in named_params],
+                        create_graph=True,
+                        allow_unused=True,
+                    )
+                    dummy_grad_dict = {
+                        name: grad
+                        for (name, _), grad in zip(named_params, dummy_gradients)
+                        if grad is not None
+                    }
+                    grad_losses.append(self.compute_gradient_loss(dummy_grad_dict, real_gradients))
+                    tv_losses.append(self.total_variation(dummy_data))
+                    l2_losses.append((dummy_data ** 2).sum())
+
+                grad_loss = sum(grad_losses) / float(len(grad_losses))
+                tv_loss = (sum(tv_losses) / float(len(tv_losses))) * float(self.config.tv_weight)
+                l2_loss = (sum(l2_losses) / float(len(l2_losses))) * float(self.config.l2_weight)
+
+                group_loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+                if n_group > 1 and float(self.config.group_consistency_weight) > 0.0:
+                    stacked = torch.stack([d for d in dummy_data_list], dim=0)  # (G,B,C,H,W)
+                    mean = stacked.mean(dim=0, keepdim=False)
+                    group_loss = ((stacked - mean.unsqueeze(0)) ** 2).mean() * float(
+                        self.config.group_consistency_weight
+                    )
+
+                total_loss = grad_loss + tv_loss + l2_loss + group_loss
                 total_loss.backward()
                 closure.loss_val = total_loss.item()
                 return total_loss
+
             optimizer.step(closure)
+
+            # Clamp inputs to a valid image range after each optimizer step.
+            with torch.no_grad():
+                for d in dummy_data_list:
+                    d.clamp_(0.0, 1.0)
+
             if hasattr(closure, 'loss_val'):
-                loss_val = closure.loss_val
+                loss_val = float(closure.loss_val)
                 history.append(loss_val)
                 if self.config.verbose and iteration % 20 == 0:
                     logger.info(f"Iter {iteration}/{self.config.max_iterations} | Loss: {loss_val:.6f}")
                 if loss_val < best_loss - self.config.tolerance:
                     best_loss, patience_counter = loss_val, 0
-                    best_data = dummy_data.detach().clone()
+                    # For group methods, the mean is a stable representative.
+                    if n_group > 1:
+                        best_data = torch.stack([d.detach() for d in dummy_data_list], dim=0).mean(dim=0)
+                    else:
+                        best_data = dummy_data_list[0].detach().clone()
                     best_iter = iteration
                 else:
                     patience_counter += 1
                 if patience_counter >= self.config.patience:
                     logger.info(f"Early stopping at iteration {iteration}")
                     break
+
+        if dummy_label_logits_list:
+            # Best-effort decoded labels for reporting.
+            with torch.no_grad():
+                probs = torch.softmax(dummy_label_logits_list[0].detach(), dim=1)
+                decoded = probs.argmax(dim=1)
+        else:
+            decoded = dummy_label.detach()
+
         return {
             'reconstructed_data': best_data.detach().cpu().numpy(),
-            'reconstructed_label': dummy_label.cpu().numpy(),
+            'reconstructed_label': decoded.detach().cpu().numpy(),
             'inferred_label': inferred_label.cpu().numpy() if inferred_label is not None else None,
             'final_loss': float(best_loss),
             'best_iteration': int(best_iter),
             'iterations': int(len(history)),
             'history': history,
-            'method': self.config.method,
+            'method': str(method),
             'success': bool(best_loss < 1.0),
             'mitre_atlas': {
                 'technique': 'AML.T0024.001',

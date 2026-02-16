@@ -85,6 +85,14 @@ dev = [
     "flake8>=6.0.0",
     "mypy>=1.0.0",
 ]
+baselines = [
+    # EDNN §5.4 baselines (TextFooler/BAE/BERT-Attack)
+    "textattack",
+    "datasets",
+    # Attention §5.7 baselines (prompt injection scanners)
+    "llm-guard",
+    "rebuff",
+]
 docs = [
     "sphinx>=4.0.0",
     "sphinx-rtd-theme>=1.0.0",

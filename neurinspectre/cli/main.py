@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _CLICK_COMMANDS = {
     "attack",
     "analyze",
+    "baselines",
     "characterize",
     "defense-analyzer",
     "doctor",
@@ -1270,6 +1271,12 @@ def config_cmd(config_type: str, output: str | None) -> None:
         click.echo(f"Configuration written to {output}")
     else:
         click.echo(config_str)
+
+
+# Baseline comparison harness (Issue 4).
+from .baselines_cmd import baselines_cmd as baselines_cli_cmd  # noqa: E402
+
+cli.add_command(baselines_cli_cmd)
 
 
 def main() -> None:
