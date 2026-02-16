@@ -30,6 +30,7 @@ from ..evaluation.artifact_integrity import nuscenes_label_map_hash_gate
 from ..evaluation.budgets import get_attack_budgets, resolve_attack_config
 from ..evaluation.datasets import DatasetFactory
 from ..evaluation.validity_gates import evaluate_clean_validity, resolve_validity_gates
+from .metadata import write_run_metadata
 from .exporters import export_evaluation_json, export_evaluation_sarif
 from .formatters import build_console, render_evaluation_report
 from .progress import ProgressReporter
@@ -90,6 +91,16 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
 
     out_dir = Path(kwargs.get("output_dir", "evaluation_results"))
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Best-effort artifact metadata capture for AE/debugging.
+    try:
+        write_run_metadata(
+            out_dir,
+            config_path=config_path,
+            device=str(device),
+            extra={"command": "evaluate"},
+        )
+    except Exception:
+        logger.debug("Failed to write run metadata", exc_info=True)
 
     defense_filter = set(kwargs.get("defenses") or [])
     attack_filter = set(kwargs.get("attacks") or [])

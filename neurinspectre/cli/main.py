@@ -32,6 +32,7 @@ _CLICK_COMMANDS = {
     "attack",
     "characterize",
     "defense-analyzer",
+    "doctor",
     "evaluate",
     "table2",
     "table2-smoke",
@@ -980,6 +981,25 @@ def table2_smoke_cmd(ctx: click.Context, **kwargs) -> None:
     from .table2_smoke_cmd import run_table2_smoke
 
     run_table2_smoke(ctx, **kwargs)
+
+
+@cli.command("doctor")
+@click.option("--json-output", type=click.Path(), help="Write environment report JSON to path")
+@click.option("--as-json", is_flag=True, help="Print environment report JSON to stdout")
+@click.option(
+    "--models-dir",
+    type=click.Path(),
+    default="models",
+    show_default=True,
+    help="Models directory to scan for stub metadata",
+)
+@click.option("--check-models/--no-check-models", default=True, help="Scan models dir for stub markers")
+@click.pass_context
+def doctor_cli_cmd(ctx: click.Context, **kwargs) -> None:
+    """Environment + dependency sanity checks (no network)."""
+    from .doctor_cmd import run_doctor
+
+    run_doctor(ctx, **kwargs)
 
 
 @cli.command("config")
