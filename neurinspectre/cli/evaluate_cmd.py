@@ -91,13 +91,14 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
 
     out_dir = Path(kwargs.get("output_dir", "evaluation_results"))
     out_dir.mkdir(parents=True, exist_ok=True)
+    smoke_test = bool(kwargs.get("smoke_test", False))
     # Best-effort artifact metadata capture for AE/debugging.
     try:
         write_run_metadata(
             out_dir,
             config_path=config_path,
             device=str(device),
-            extra={"command": "evaluate"},
+            extra={"command": "evaluate", "smoke_test": smoke_test},
         )
     except Exception:
         logger.debug("Failed to write run metadata", exc_info=True)
@@ -117,6 +118,62 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
         defenses = [d for d in defenses if d["name"] in defense_filter or d["type"] in defense_filter]
     if attack_filter:
         attacks = [a for a in attacks if a["name"] in attack_filter]
+
+    if smoke_test:
+        # Smoke mode should be fast and self-contained; disable baseline validation
+        # and clamp dataset sizes/iterations to keep runtime bounded.
+        config["baseline_validation"] = {"enabled": False}
+        try:
+            config["iterations"] = min(int(config.get("iterations", config.get("attack_iterations", 100))), 10)
+        except Exception:
+            config["iterations"] = 10
+        try:
+            config["attack_batch_size"] = min(int(config.get("attack_batch_size", 128)), 64)
+        except Exception:
+            config["attack_batch_size"] = 64
+        datasets_cfg = config.get("datasets") or {}
+        if isinstance(datasets_cfg, dict):
+            for _ds_name, ds in datasets_cfg.items():
+                if not isinstance(ds, dict):
+                    continue
+                ns = ds.get("num_samples", ds.get("n_samples", DEFAULT_EVAL_SAMPLES))
+                try:
+                    ns_i = int(ns)
+                except Exception:
+                    ns_i = DEFAULT_EVAL_SAMPLES
+                ds["num_samples"] = min(ns_i, 100)
+                try:
+                    ds["batch_size"] = min(int(ds.get("batch_size", config["attack_batch_size"])), 64)
+                except Exception:
+                    ds["batch_size"] = int(config["attack_batch_size"])
+                ds.setdefault("num_workers", 0)
+
+        # Prefer a "fast" defense/attack if present; otherwise take the first.
+        def _pick_defense(entries: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+            prefer = ("none", "jpeg", "bitdepth")
+            for want in prefer:
+                for d in entries:
+                    key = str(d.get("type", d.get("name", ""))).lower()
+                    if key == want or str(d.get("name", "")).lower() == want:
+                        return d
+            return entries[0] if entries else None
+
+        def _pick_attack(entries: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+            prefer = ("pgd", "apgd", "neurinspectre")
+            for want in prefer:
+                for a in entries:
+                    if str(a.get("name", "")).lower() == want:
+                        return a
+            return entries[0] if entries else None
+
+        dsel = _pick_defense(defenses)
+        asel = _pick_attack(attacks)
+        defenses = [dsel] if dsel else []
+        attacks = [asel] if asel else []
+        parallel = 1
+
+        if not defenses or not attacks:
+            raise click.ClickException("Smoke test requested but config contains no runnable defenses/attacks.")
 
     if parallel > RECOMMENDED_MAX_WORKERS:
         logger.warning(

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _CLICK_COMMANDS = {
     "attack",
+    "analyze",
     "characterize",
     "defense-analyzer",
     "doctor",
@@ -305,6 +306,244 @@ def attack_cmd(ctx: click.Context, **kwargs) -> None:
     from .attack_cmd import run_attack
 
     run_attack(ctx, **kwargs)
+
+
+@cli.command("analyze")
+@click.option(
+    "--model",
+    "-m",
+    required=False,
+    type=str,
+    help="Optional model path or name (defaults to a bundled CIFAR-10 TorchScript model when available)",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase verbosity for this command",
+)
+@click.option(
+    "--dataset",
+    "-d",
+    required=True,
+    type=click.Choice(
+        ["cifar10", "cifar100", "imagenet", "imagenet100", "ember", "nuscenes", "custom"]
+    ),
+    help="Dataset name",
+)
+@click.option(
+    "--data-path",
+    type=click.Path(),
+    help="Optional dataset root override (built-in datasets can auto-download if omitted)",
+)
+@click.option(
+    "--labels-path",
+    type=click.Path(exists=True),
+    help="Path to nuScenes label map JSON (required for dataset=nuscenes)",
+)
+@click.option(
+    "--nuscenes-version",
+    type=str,
+    default="v1.0-mini",
+    show_default=True,
+    help="nuScenes version string (e.g., v1.0-mini, v1.0-trainval)",
+)
+@click.option("--defense", required=True, type=str, help="Defense name (e.g., jpeg, bitdepth, randsmooth, ...)")
+@click.option(
+    "--epsilon",
+    "-e",
+    type=float,
+    default=8 / 255,
+    help="Perturbation budget (default: 8/255 for Linf)",
+)
+@click.option(
+    "--norm",
+    type=click.Choice(["Linf", "L2", "L1"]),
+    default="Linf",
+    help="Lp norm for perturbation budget",
+)
+@click.option(
+    "--iterations",
+    "-n",
+    type=int,
+    default=100,
+    help="Number of attack iterations",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    type=int,
+    default=128,
+    help="Batch size for evaluation",
+)
+@click.option(
+    "--num-samples",
+    type=int,
+    default=1000,
+    help="Number of samples to attack",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default="results",
+    show_default=True,
+    help="Directory to write the default output JSON into",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Output file for results (overrides --output-dir default naming)",
+)
+@click.option(
+    "--report/--no-report",
+    default=True,
+    help="Print findings to stdout",
+)
+@click.option(
+    "--no-progress",
+    is_flag=True,
+    help="Disable progress indicators",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["cuda", "cpu", "mps", "auto"]),
+    default="auto",
+    help="Device for computation",
+)
+@click.option(
+    "--seed",
+    type=int,
+    default=42,
+    help="Random seed for reproducibility",
+)
+@click.pass_context
+def analyze_cmd(ctx: click.Context, **kwargs) -> None:
+    """
+    Paper-style alias for running a single adaptive evasion evaluation.
+
+    This wraps `neurinspectre attack` with `--attack-type neurinspectre` and a
+    default output location under `results/`.
+    """
+
+    import os
+    from pathlib import Path
+
+    def _normalize_defense_name(raw: str) -> str:
+        key = str(raw or "").strip().lower().replace("-", "_")
+        key = key.replace(" ", "_")
+        aliases = {
+            "jpeg_compression": "jpeg",
+            "jpegcompression": "jpeg",
+            "bit_depth": "bitdepth",
+            "bit_depth_reduction": "bitdepth",
+            "randomized_smoothing": "randsmooth",
+            "randsmoothing": "randsmooth",
+            "featsqueeze": "feature_squeezing",
+            "feature_squeeze": "feature_squeezing",
+            "featuresqueezing": "feature_squeezing",
+            "gradreg": "gradient_regularization",
+            "gradient_reg": "gradient_regularization",
+            "defensive_distillation": "distillation",
+            "distill": "distillation",
+            "at_transforms": "at_transform",
+            "at_transformations": "at_transform",
+            "spatial_smooth": "spatial_smoothing",
+            "randpadcrop": "random_pad_crop",
+            "randompadcrop": "random_pad_crop",
+            "certified": "certified_defense",
+        }
+        canonical = {
+            "none",
+            "jpeg",
+            "bitdepth",
+            "randsmooth",
+            "thermometer",
+            "distillation",
+            "ensemble",
+            "feature_squeezing",
+            "gradient_regularization",
+            "at_transform",
+            "spatial_smoothing",
+            "random_pad_crop",
+            "certified_defense",
+        }
+        key = aliases.get(key, key)
+        if key not in canonical:
+            raise click.ClickException(
+                "Unknown defense name for `analyze`: "
+                f"{raw!r}. Expected one of: {', '.join(sorted(canonical))}"
+            )
+        return key
+
+    dataset = str(kwargs.get("dataset"))
+    defense = _normalize_defense_name(str(kwargs.get("defense")))
+
+    model = kwargs.get("model")
+    if not model:
+        # Default bundled models (best-effort). For other datasets, require explicit model.
+        if dataset == "cifar10":
+            for cand in (
+                Path("models") / "cifar10_resnet20_norm_ts.pt",
+                Path("models") / "cifar10_cnn_ts.pt",
+            ):
+                if cand.exists():
+                    model = str(cand)
+                    break
+        if not model:
+            raise click.ClickException(
+                f"Missing --model and no default model found for dataset={dataset}. "
+                "Provide --model pointing to a local model artifact."
+            )
+
+    # Default output path under results/
+    output = kwargs.get("output")
+    if not output:
+        out_dir = Path(str(kwargs.get("output_dir") or "results"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output = out_dir / f"analyze_{dataset}_{defense}.json"
+    output = str(output)
+
+    # If user passed a data-path string that does not exist, do not fail at Click parsing time;
+    # let dataset loaders auto-download for supported datasets.
+    data_path = kwargs.get("data_path")
+    if data_path:
+        dp = Path(str(data_path))
+        if not dp.exists():
+            # Preserve the user intent but avoid a confusing "path must exist" error at CLI layer.
+            os.makedirs(dp, exist_ok=True)
+
+    from .attack_cmd import run_attack
+
+    run_attack(
+        ctx,
+        model=str(model),
+        verbose=kwargs.get("verbose", 0),
+        dataset=dataset,
+        data_path=data_path,
+        labels_path=kwargs.get("labels_path"),
+        nuscenes_version=kwargs.get("nuscenes_version"),
+        defense=defense,
+        defense_config=None,
+        attack_type="neurinspectre",
+        epsilon=float(kwargs.get("epsilon", 8 / 255)),
+        norm=str(kwargs.get("norm", "Linf")),
+        iterations=int(kwargs.get("iterations", 100)),
+        batch_size=int(kwargs.get("batch_size", 128)),
+        num_samples=int(kwargs.get("num_samples", 1000)),
+        targeted=False,
+        output=output,
+        report=bool(kwargs.get("report", True)),
+        report_format="text",
+        brief=False,
+        summary_only=False,
+        color=False,
+        no_color=False,
+        no_progress=bool(kwargs.get("no_progress", False)),
+        device=str(kwargs.get("device", "auto")),
+        seed=int(kwargs.get("seed", 42)),
+    )
 
 
 @cli.command("characterize")
@@ -667,6 +906,11 @@ def compare_cmd(ctx: click.Context, **kwargs) -> None:
     "--resume",
     is_flag=True,
     help="Resume interrupted evaluation",
+)
+@click.option(
+    "--smoke-test",
+    is_flag=True,
+    help="Run a minimal smoke subset (limits samples/iterations and selects 1 defense + 1 attack)",
 )
 @click.option(
     "--device",
@@ -1045,6 +1289,7 @@ def main() -> None:
                 "rl-obfuscation",
                 "attention-security",
                 "adversarial-ednn",
+                "subnetwork_hijack",
                 "statistical_evasion",
                 "statistical-evasion",
                 # Debug/infra helpers in legacy CLI

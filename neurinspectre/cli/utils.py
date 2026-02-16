@@ -9,6 +9,8 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
+import platform
 import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -561,12 +563,27 @@ def load_dataset(
 ) -> Tuple[DataLoader, torch.Tensor, torch.Tensor]:
     name = str(dataset_name).lower()
     pin_memory = _should_pin_memory(device)
+    effective_workers = int(num_workers)
+    if effective_workers > 0:
+        # macOS + PyTorch shared-memory workers can fail in sandboxed/managed
+        # environments when `torch_shm_manager` is not executable. Prefer a
+        # stable default for AE/repro runs.
+        if platform.system() == "Darwin":
+            effective_workers = 0
+        else:
+            try:
+                torch_dir = Path(torch.__file__).resolve().parent
+                shm = torch_dir / "bin" / "torch_shm_manager"
+                if shm.exists() and not os.access(shm, os.X_OK):
+                    effective_workers = 0
+            except Exception:
+                pass
     if name in {"cifar10", "imagenet100", "ember"}:
         kwargs: Dict[str, Any] = {
             "n_samples": int(num_samples),
             "seed": int(seed),
             "batch_size": int(batch_size),
-            "num_workers": int(num_workers),
+            "num_workers": int(effective_workers),
             "split": split,
             "pin_memory": bool(pin_memory),
         }
@@ -578,7 +595,7 @@ def load_dataset(
             "n_samples": int(num_samples),
             "seed": int(seed),
             "batch_size": int(batch_size),
-            "num_workers": int(num_workers),
+            "num_workers": int(effective_workers),
             "pin_memory": bool(pin_memory),
             "split": split,
         }
@@ -596,7 +613,7 @@ def load_dataset(
             num_samples=num_samples,
             seed=seed,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=effective_workers,
             split=split,
             download=download,
             pin_memory=pin_memory,
@@ -607,7 +624,7 @@ def load_dataset(
             num_samples=num_samples,
             seed=seed,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=effective_workers,
             split=split,
             pin_memory=pin_memory,
         )
@@ -617,7 +634,7 @@ def load_dataset(
             num_samples=num_samples,
             seed=seed,
             batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=effective_workers,
             pin_memory=pin_memory,
         )
 

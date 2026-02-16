@@ -191,6 +191,7 @@ def _sha256_installed_neurinspectre() -> Dict[str, Any]:
 
     files.sort(key=lambda p: str(p))
     total_bytes = 0
+    total_lines = 0
     for p in files:
         rel = str(p.relative_to(pkg_dir)).encode("utf-8", errors="ignore")
         h.update(rel + b"\n")
@@ -199,6 +200,9 @@ def _sha256_installed_neurinspectre() -> Dict[str, Any]:
         except Exception:
             data = b""
         total_bytes += len(data)
+        # Count lines without allocating a large split list.
+        if data:
+            total_lines += int(data.count(b"\n")) + (0 if data.endswith(b"\n") else 1)
         h.update(data)
 
     return {
@@ -206,6 +210,7 @@ def _sha256_installed_neurinspectre() -> Dict[str, Any]:
         "package_dir": str(pkg_dir),
         "file_count": int(len(files)),
         "bytes_hashed": int(total_bytes),
+        "py_lines": int(total_lines),
         "sha256": h.hexdigest(),
     }
 
@@ -339,6 +344,8 @@ def run_doctor(ctx: click.Context, **kwargs: Any) -> None:
 
     if isinstance(pkg_hash, dict) and pkg_hash.get("available"):
         click.echo(f"Installed package sha256 (py): {pkg_hash.get('sha256')}")
+        if pkg_hash.get("py_lines") is not None:
+            click.echo(f"Installed package LOC (py): {int(pkg_hash.get('py_lines') or 0)}")
 
     # Print declared dependency versions (AE-friendly; long but explicit).
     declared = (deps.get("declared") or {}) if isinstance(deps, dict) else {}

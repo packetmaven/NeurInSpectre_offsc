@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # regardless of which console-script entrypoint is used.
 _CLICK_COMMANDS = {
     "attack",
+    "analyze",
     "characterize",
     "defense-analyzer",
     "doctor",
