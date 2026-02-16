@@ -105,9 +105,13 @@ class ImageNet100Dataset:
         split: str = "val",
         pin_memory: bool = True,
     ) -> Tuple[DataLoader, torch.Tensor, torch.Tensor]:
-        if not os.path.exists(root):
+        # Respect the user-provided root. We accept either:
+        #   1) root=/path/to/imagenet   (contains train/ + val/)
+        #   2) root=/path/to/imagenet/val (points directly at the split dir)
+        root_path = Path(os.path.expandvars(os.path.expanduser(str(root)))).resolve()
+        if not root_path.exists():
             raise FileNotFoundError(
-                f"ImageNet not found at {root}. "
+                f"ImageNet-100 not found at {root_path}. "
                 "Download from https://www.image-net.org/download.php"
             )
 
@@ -119,9 +123,30 @@ class ImageNet100Dataset:
             ]
         )
 
-        split_dir = "val" if str(split).lower() in {"val", "valid", "validation"} else "train"
+        # ImageNet conventions are (train, val). Treat "test" as "val" for UX.
+        split_key = str(split).lower().strip()
+        split_dir = "val" if split_key in {"val", "valid", "validation", "test"} else "train"
+
+        # First try the canonical layout: <root>/{train,val}
+        split_root = root_path / split_dir
+        if not split_root.exists():
+            # If the caller passed <root>/<train|val>, treat parent as base.
+            if root_path.name in {"train", "val"}:
+                parent = root_path.parent
+                candidate = parent / split_dir
+                if candidate.exists():
+                    split_root = candidate
+            # Otherwise, fail with a targeted message.
+        if not split_root.exists():
+            raise FileNotFoundError(
+                f"ImageNet-100 split directory not found. "
+                f"Expected '{(root_path / split_dir)}' to exist (split={split_key!r}). "
+                f"If you passed a split directory directly, use root='{(root_path.parent / split_dir)}' "
+                f"or set split accordingly."
+            )
+
         valset = torchvision.datasets.ImageFolder(
-            root=os.path.join(root, split_dir),
+            root=str(split_root),
             transform=transform,
         )
 

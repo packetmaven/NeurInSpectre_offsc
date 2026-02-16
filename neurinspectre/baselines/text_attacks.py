@@ -78,6 +78,15 @@ def run_textattack_recipe(
             "Text baselines require `torch` and `transformers` installed."
         ) from exc
 
+    # TextAttack uses a global device singleton (`textattack.shared.utils.device`)
+    # for some constraints (notably SBERT). Ensure the CLI's `--device` is honored.
+    try:
+        from textattack.shared import utils as ta_utils  # type: ignore
+
+        ta_utils.device = torch.device(str(device))
+    except Exception:
+        ta_utils = None
+
     recipe_key = str(recipe or "").strip().lower().replace("-", "_")
     recipe_map = {
         "textfooler": "TextFoolerJin2019",
@@ -211,6 +220,37 @@ def run_textattack_recipe(
     n_succeeded = 0
     n_failed = 0
     n_skipped = 0
+    failed_examples = []
+    skipped_examples = []
+
+    def _safe_int(v: Any) -> Optional[int]:
+        try:
+            if v is None:
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    def _safe_float(v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _excerpt(text: Any, *, limit: int = 220) -> Optional[str]:
+        if text is None:
+            return None
+        try:
+            s = str(text)
+        except Exception:
+            return None
+        s = s.replace("\n", " ").strip()
+        if len(s) <= limit:
+            return s
+        return s[:limit].rstrip() + "..."
+
     for r in results:
         n_total += 1
         tname = type(r).__name__.lower()
@@ -221,20 +261,64 @@ def run_textattack_recipe(
         elif "skippedattackresult" in tname or tname.startswith("skipped"):
             n_skipped += 1
 
-    success_rate = (n_succeeded / n_total) if n_total else None
+        # Root-cause details: keep only failed+skipped examples (small output).
+        if "failedattackresult" in tname or tname.startswith("failed") or "skippedattackresult" in tname or tname.startswith("skipped"):
+            try:
+                orig = getattr(r, "original_result", None)
+                pert = getattr(r, "perturbed_result", None)
+                gt = _safe_int(getattr(orig, "ground_truth_output", None))
+                pred_orig = _safe_int(getattr(orig, "output", None))
+                pred_pert = _safe_int(getattr(pert, "output", None))
+                rec = {
+                    "index": int(n_total - 1),
+                    "result_type": type(r).__name__,
+                    "ground_truth": gt,
+                    "pred_orig": pred_orig,
+                    "pred_pert": pred_pert,
+                    "orig_score": _safe_float(getattr(orig, "score", None)),
+                    "pert_score": _safe_float(getattr(pert, "score", None)),
+                    "goal_status": _safe_int(getattr(orig, "goal_status", None)),
+                    "orig_text_excerpt": _excerpt(getattr(getattr(orig, "attacked_text", None), "text", None)),
+                    "pert_text_excerpt": _excerpt(getattr(getattr(pert, "attacked_text", None), "text", None)),
+                }
+                if "skippedattackresult" in tname or tname.startswith("skipped"):
+                    reason = "skipped"
+                    if gt is not None and pred_orig is not None and gt != pred_orig:
+                        reason = "clean_misclassified"
+                    rec["reason"] = reason
+                    skipped_examples.append(rec)
+                else:
+                    rec["reason"] = "attack_failed_to_flip_label"
+                    failed_examples.append(rec)
+            except Exception:
+                # Best-effort only; do not make the baseline brittle.
+                pass
+
+    # Report success rate the same way we report ASR elsewhere in NeurInSpectre:
+    # among *attackable* examples only (exclude SKIPPED, which are clean-misclassified).
+    n_attackable = int(n_succeeded + n_failed)
+    success_rate_attackable = (n_succeeded / n_attackable) if n_attackable else None
+    success_rate_including_skipped = (n_succeeded / n_total) if n_total else None
     return TextAttackRunResult(
         recipe=str(recipe_key),
         model=str(model_name_or_path),
         dataset="sst2",
         split=str(hf_split),
         num_examples=int(num_examples),
-        success_rate=success_rate,
+        success_rate=success_rate_attackable,
         details={
             "succeeded": n_succeeded,
             "failed": n_failed,
             "skipped": n_skipped,
             "total": n_total,
+            "attackable": n_attackable,
+            "success_rate_attackable": success_rate_attackable,
+            "success_rate_including_skipped": success_rate_including_skipped,
             "semantic_constraint_backend": semantic_constraint_backend,
+            "requested_device": str(device),
+            "textattack_device": None if ta_utils is None else str(getattr(ta_utils, "device", None)),
+            "failed_examples": failed_examples,
+            "skipped_examples": skipped_examples,
         },
     )
 
