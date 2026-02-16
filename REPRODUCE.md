@@ -42,7 +42,7 @@ neurinspectre doctor
 Build and run the CUDA container (requires NVIDIA Container Toolkit on the host):
 
 ```bash
-docker build -t neurinspectre:ae .
+docker build --platform=linux/amd64 -t neurinspectre:ae .
 docker run --gpus all --rm -it neurinspectre:ae doctor
 ```
 
