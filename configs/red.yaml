@@ -14,4 +14,40 @@ outputs:
   visuals: true
   json_reports: true
 
+# ---------------------------------------------------------------------------
+# Click evaluation config (used by `neurinspectre evaluate`)
+# ---------------------------------------------------------------------------
+datasets:
+  cifar10:
+    path: ./data/cifar10
+    split: test
+    num_samples: 1000
+    batch_size: 128
+    num_workers: 0
+
+models:
+  cifar10: models/cifar10_resnet20_norm_ts.pt
+
+defenses:
+  - name: jpeg
+    type: jpeg
+    dataset: cifar10
+    quality: 75
+
+attacks:
+  - pgd
+  - neurinspectre
+
+perturbation:
+  epsilon: 0.03137254901960784  # 8/255
+  norm: Linf
+
+iterations: 100
+
+validity_gates:
+  enabled: false
+
+baseline_validation:
+  enabled: false
+
 
