@@ -15,13 +15,36 @@ import numpy as np
 from scipy import stats
 from scipy.linalg import inv, LinAlgError
 from sklearn.covariance import MinCovDet
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 import logging
 import warnings
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
+
+
+def _bonferroni_adjust(p_values: List[float], *, m: Optional[int] = None) -> List[float]:
+    """
+    Bonferroni p-value adjustment (FWER control).
+
+    Given a family of m hypothesis tests with raw p-values p_i, the Bonferroni-adjusted
+    p-values are:
+        p_i_adj = min(p_i * m, 1)
+    """
+    finite = []
+    for p in p_values:
+        try:
+            p_f = float(p)
+        except Exception:
+            p_f = 1.0
+        if not np.isfinite(p_f):
+            p_f = 1.0
+        finite.append(float(np.clip(p_f, 0.0, 1.0)))
+    m_eff = int(m) if m is not None else len(finite)
+    m_eff = max(1, m_eff)
+    return [float(min(1.0, p * m_eff)) for p in finite]
+
 
 @dataclass
 class DriftDetectionResults:
@@ -32,7 +55,7 @@ class DriftDetectionResults:
     confidence_interval: Tuple[float, float]
     change_points: List[int]
     drift_magnitude: float
-    statistical_significance: Dict[str, float]
+    statistical_significance: Dict[str, Any]
     feature_drift_scores: np.ndarray
 
 class BaseDriftDetector(ABC):
@@ -206,6 +229,8 @@ class HotellingT2DriftDetector(BaseDriftDetector):
             'degrees_freedom_1': df1,
             'degrees_freedom_2': df2,
             't2_critical': float(T2_critical),
+            'sample_sizes': (int(n1), int(n2)),
+            'n_features': int(p),
         }
         
         return DriftDetectionResults(
@@ -361,7 +386,8 @@ class KolmogorovSmirnovDriftDetector(BaseDriftDetector):
             'ks_statistic': ks_stat,
             'p_value': p_value,
             'critical_value': critical_value,
-            'sample_sizes': (n1, n2)
+            'sample_sizes': (int(n1), int(n2)),
+            'n_features': int(reference_data.shape[1]) if reference_data.ndim == 2 else 1,
         }
         
         return DriftDetectionResults(
@@ -374,6 +400,185 @@ class KolmogorovSmirnovDriftDetector(BaseDriftDetector):
             statistical_significance=statistical_significance,
             feature_drift_scores=feature_drift_scores
         )
+
+
+class KSDADCvMDriftDetector(BaseDriftDetector):
+    """
+    Distribution drift detector using a trio of classical two-sample tests:
+      - KS (Kolmogorov-Smirnov)
+      - AD (Anderson-Darling k-sample; here k=2)
+      - CvM (Cramér–von Mises)
+
+    Aggregation uses Bonferroni correction over the test family to control the
+    family-wise error rate (FWER) at alpha = 1 - confidence_level.
+
+    For multivariate inputs, we project to 1D (default: first principal component)
+    to run the univariate tests in a well-defined way.
+    """
+
+    def __init__(self, confidence_level: float = 0.95, projection: str = "pca1"):
+        super().__init__(confidence_level)
+        self.projection = str(projection).lower()
+
+    @staticmethod
+    def _to_1d(x: np.ndarray, y: np.ndarray, *, projection: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        meta: Dict[str, object] = {
+            "projection": projection,
+            "input_shapes": (tuple(x.shape), tuple(y.shape)),
+        }
+        if x.ndim == 1 and y.ndim == 1:
+            return x, y, meta
+        if x.ndim != 2 or y.ndim != 2:
+            return x.reshape(-1), y.reshape(-1), {**meta, "projection": "flatten"}
+
+        # 2D -> 1D projection
+        if x.shape[1] == 1 and y.shape[1] == 1:
+            return x[:, 0], y[:, 0], {**meta, "projection": "feature0"}
+
+        if projection in {"pca", "pca1", "pc1"}:
+            try:
+                from sklearn.decomposition import PCA
+
+                pca = PCA(n_components=1, random_state=42)
+                x1 = pca.fit_transform(x).reshape(-1)
+                x2 = pca.transform(y).reshape(-1)
+                meta["explained_variance_ratio"] = float(pca.explained_variance_ratio_[0])
+                return x1, x2, meta
+            except Exception as exc:
+                meta["projection_error"] = str(exc)
+                return x[:, 0], y[:, 0], {**meta, "projection": "feature0_fallback"}
+
+        # Default fallback: feature 0.
+        return x[:, 0], y[:, 0], {**meta, "projection": "feature0"}
+
+    def detect_drift(self, reference_data: np.ndarray, current_data: np.ndarray) -> DriftDetectionResults:
+        logger.info(
+            "KS/AD/CvM drift detection: ref=%s cur=%s",
+            getattr(reference_data, "shape", None),
+            getattr(current_data, "shape", None),
+        )
+
+        x1, x2, proj_meta = self._to_1d(reference_data, current_data, projection=self.projection)
+        x1 = np.asarray(x1, dtype=np.float64)
+        x2 = np.asarray(x2, dtype=np.float64)
+        x1 = x1[np.isfinite(x1)]
+        x2 = x2[np.isfinite(x2)]
+
+        n1 = int(x1.size)
+        n2 = int(x2.size)
+        n_features = int(reference_data.shape[1]) if np.asarray(reference_data).ndim == 2 else 1
+
+        # Guard: if too few samples, do not attempt to produce fragile p-values.
+        if n1 < 2 or n2 < 2:
+            stats_block = {
+                "sample_sizes": (n1, n2),
+                "n_features": n_features,
+                "projection": proj_meta,
+                "bonferroni_m": 3,
+                "alpha": float(self.alpha),
+                "reason": "insufficient_samples",
+            }
+            return DriftDetectionResults(
+                drift_detected=False,
+                drift_score=0.0,
+                p_value=1.0,
+                confidence_interval=(0.0, 1.0),
+                change_points=[],
+                drift_magnitude=0.0,
+                statistical_significance=stats_block,
+                feature_drift_scores=np.zeros((n_features,), dtype=np.float64),
+            )
+
+        raw: Dict[str, Dict[str, float]] = {}
+        pvals: List[float] = []
+
+        # KS two-sample
+        try:
+            ks_res = stats.ks_2samp(x1, x2)
+            ks_stat = float(getattr(ks_res, "statistic", ks_res[0]))
+            ks_p = float(getattr(ks_res, "pvalue", ks_res[1]))
+        except Exception:
+            ks_stat, ks_p = 0.0, 1.0
+        raw["ks"] = {"statistic": ks_stat, "p_value": float(np.clip(ks_p, 0.0, 1.0))}
+        pvals.append(raw["ks"]["p_value"])
+
+        # Anderson-Darling k-sample (k=2)
+        try:
+            ad_res = stats.anderson_ksamp([x1, x2])
+            ad_stat = float(getattr(ad_res, "statistic", 0.0))
+            # SciPy returns .pvalue in modern versions; .significance_level exists for compatibility.
+            ad_p = getattr(ad_res, "pvalue", None)
+            if ad_p is None:
+                ad_p = getattr(ad_res, "significance_level", 1.0)
+            ad_p = float(ad_p)
+        except Exception:
+            ad_stat, ad_p = 0.0, 1.0
+        raw["ad"] = {"statistic": ad_stat, "p_value": float(np.clip(ad_p, 0.0, 1.0))}
+        pvals.append(raw["ad"]["p_value"])
+
+        # Cramér–von Mises two-sample
+        try:
+            cvm_res = stats.cramervonmises_2samp(x1, x2)
+            cvm_stat = float(getattr(cvm_res, "statistic", 0.0))
+            cvm_p = float(getattr(cvm_res, "pvalue", 1.0))
+        except Exception:
+            cvm_stat, cvm_p = 0.0, 1.0
+        raw["cvm"] = {"statistic": cvm_stat, "p_value": float(np.clip(cvm_p, 0.0, 1.0))}
+        pvals.append(raw["cvm"]["p_value"])
+
+        m = len(pvals)
+        p_adj = _bonferroni_adjust(pvals, m=m)
+        for key, p_a in zip(("ks", "ad", "cvm"), p_adj):
+            raw[key]["p_value_bonferroni"] = float(p_a)
+
+        p_combined = float(min(p_adj)) if p_adj else 1.0
+        drift_detected = bool(p_combined < float(self.alpha))
+        drift_score = float(np.clip(1.0 - p_combined, 0.0, 1.0))
+
+        # Per-feature KS statistics are still useful for localization.
+        try:
+            ref2 = np.asarray(reference_data, dtype=np.float64)
+            cur2 = np.asarray(current_data, dtype=np.float64)
+            if ref2.ndim == 2 and cur2.ndim == 2 and ref2.shape[1] == cur2.shape[1]:
+                feat_scores = []
+                for j in range(ref2.shape[1]):
+                    a = ref2[:, j]
+                    b = cur2[:, j]
+                    a = a[np.isfinite(a)]
+                    b = b[np.isfinite(b)]
+                    if a.size < 2 or b.size < 2:
+                        feat_scores.append(0.0)
+                    else:
+                        feat_scores.append(float(stats.ks_2samp(a, b).statistic))
+                feature_drift_scores = np.asarray(feat_scores, dtype=np.float64)
+            else:
+                feature_drift_scores = np.zeros((n_features,), dtype=np.float64)
+        except Exception:
+            feature_drift_scores = np.zeros((n_features,), dtype=np.float64)
+
+        statistical_significance: Dict[str, object] = {
+            "sample_sizes": (n1, n2),
+            "n_features": n_features,
+            "projection": proj_meta,
+            "alpha": float(self.alpha),
+            "bonferroni_m": int(m),
+            "tests": raw,
+            "p_value_bonferroni_min": float(p_combined),
+        }
+
+        return DriftDetectionResults(
+            drift_detected=drift_detected,
+            drift_score=drift_score,
+            p_value=float(p_combined),
+            confidence_interval=(0.0, 1.0),
+            change_points=[],
+            drift_magnitude=drift_score,
+            statistical_significance=statistical_significance,
+            feature_drift_scores=feature_drift_scores,
+        )
+
 
 class BayesianChangePointDetector(BaseDriftDetector):
     """
@@ -533,6 +738,8 @@ class BayesianChangePointDetector(BaseDriftDetector):
             'mean_posterior_prob': float(np.mean(posterior_probs)),
             'cp_threshold_p95': threshold,
             'transition_window': (transition_start, transition_end),
+            'sample_sizes': (int(reference_data.shape[0]), int(current_data.shape[0])),
+            'n_features': int(reference_data.shape[1]) if reference_data.ndim == 2 else 1,
         }
         
         return DriftDetectionResults(
@@ -570,6 +777,8 @@ class EnhancedDriftDetector:
             self.detectors['hotelling'] = HotellingT2DriftDetector(confidence_level)
         if 'ks' in methods:
             self.detectors['ks'] = KolmogorovSmirnovDriftDetector(confidence_level)
+        if 'ks_ad_cvm' in methods or 'ksadcvm' in methods:
+            self.detectors['ks_ad_cvm'] = KSDADCvMDriftDetector(confidence_level)
         if 'bayesian' in methods:
             self.detectors['bayesian'] = BayesianChangePointDetector(confidence_level)
     
@@ -653,11 +862,28 @@ class EnhancedDriftDetector:
         consensus_feature_scores = np.mean(feature_scores, axis=0)
         
         # Combined statistical significance
+        sample_sizes = None
+        n_features = None
+        for r in results.values():
+            try:
+                ss = (r.statistical_significance or {}).get("sample_sizes")
+                if ss is not None:
+                    sample_sizes = ss
+                nf = (r.statistical_significance or {}).get("n_features")
+                if nf is not None:
+                    n_features = nf
+            except Exception:
+                continue
+            if sample_sizes is not None and n_features is not None:
+                break
+
         consensus_stats = {
             'drift_votes': drift_votes,
             'total_methods': total_methods,
             'consensus_strength': drift_votes / total_methods,
-            'individual_results': {name: result.statistical_significance for name, result in results.items()}
+            'individual_results': {name: result.statistical_significance for name, result in results.items()},
+            'sample_sizes': sample_sizes,
+            'n_features': n_features,
         }
         
         return DriftDetectionResults(

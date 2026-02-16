@@ -297,9 +297,11 @@ def test_volterra_fitting():
         x.grad.zero_()
 
     analyzer = DefenseAnalyzer(model, device="cpu")
-    alpha, rmse = analyzer._fit_volterra_kernel(gradients)
+    alpha, rmse, rmse_scaled, info = analyzer._fit_volterra_kernel(gradients)
+    assert isinstance(info, dict)
     assert 0.1 <= alpha <= 0.99
     assert not np.isnan(rmse)
+    assert np.isnan(rmse_scaled) or rmse_scaled >= 0.0
 
 
 def test_spectral_features_keys():

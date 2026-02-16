@@ -464,10 +464,40 @@ def render_evaluation_report(
         header_style="bold cyan",
     )
     table.add_column("Defense", style="white", width=18)
+    # If multi-seed aggregation is present, prefer showing mean±std.
+    show_std = False
+    for res in results:
+        attacks = res.get("attacks", {}) or {}
+        for metrics in attacks.values():
+            if isinstance(metrics, dict) and metrics.get("attack_success_rate_n", 0) and metrics.get("attack_success_rate_std") is not None:
+                try:
+                    if int(metrics.get("attack_success_rate_n", 0)) > 1:
+                        show_std = True
+                        break
+                except Exception:
+                    continue
+        if show_std:
+            break
+
+    def _fmt_asr(metrics: Dict[str, Any]) -> str:
+        mean = float(metrics.get("attack_success_rate", 0.0))
+        try:
+            n = int(metrics.get("attack_success_rate_n", 0) or 0)
+        except Exception:
+            n = 0
+        std = metrics.get("attack_success_rate_std")
+        if show_std and std is not None and n > 1:
+            try:
+                s = float(std)
+            except Exception:
+                s = 0.0
+            return f"{mean*100:.1f}±{s*100:.1f}%"
+        return _format_pct(mean)
+
     if not brief:
         for attack in attack_names:
-            table.add_column(str(attack), justify="center", width=10)
-    table.add_column("Worst", justify="center", width=10)
+            table.add_column(str(attack), justify="center", width=14 if show_std else 10)
+    table.add_column("Worst", justify="center", width=14 if show_std else 10)
     table.add_column("Severity", justify="center", width=10)
 
     for res in results:
@@ -480,9 +510,10 @@ def render_evaluation_report(
             worst = max(worst, asr)
             if not brief:
                 color = "red" if asr >= 0.7 else "yellow" if asr >= 0.5 else "green"
-                row.append(f"[{color}]{_format_pct(asr)}[/{color}]")
+                row.append(f"[{color}]{_fmt_asr(dict(attacks.get(attack, {}) or {}))}[/{color}]")
         worst_color = "red" if worst >= 0.7 else "yellow" if worst >= 0.5 else "green"
-        row.append(f"[bold {worst_color}]{_format_pct(worst)}[/bold {worst_color}]")
+        # Worst column is based on mean ASR across seeds (if multi-seed).
+        row.append(f"[bold {worst_color}]{_format_pct(worst) if not show_std else f'{worst*100:.1f}%'}[/bold {worst_color}]")
         severity_label, severity_color = _risk_level(worst)
         row.append(f"[bold {severity_color}]{severity_label}[/bold {severity_color}]")
         table.add_row(*row)

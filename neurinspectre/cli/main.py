@@ -30,10 +30,13 @@ logger = logging.getLogger(__name__)
 
 _CLICK_COMMANDS = {
     "attack",
+    "analyze",
+    "baselines",
     "characterize",
     "defense-analyzer",
     "doctor",
     "evaluate",
+    "figures",
     "table2",
     "table2-smoke",
     "compare",
@@ -143,6 +146,7 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
             "at_transform",
             "spatial_smoothing",
             "random_pad_crop",
+            "rl_obfuscation",
             "certified_defense",
             "custom",
         ]
@@ -158,10 +162,48 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
 @click.option(
     "--attack-type",
     type=click.Choice(
-        ["neurinspectre", "pgd", "apgd", "autoattack", "square", "fab", "bpda", "eot"]
+        [
+            "neurinspectre",
+            "pgd",
+            "apgd",
+            "autoattack",
+            "square",
+            "fab",
+            "bpda",
+            "eot",
+            "hybrid",
+            "hybrid-volterra",
+            "mapgd",
+        ]
     ),
     default="neurinspectre",
     help="Attack algorithm (default: neurinspectre adaptive)",
+)
+@click.option(
+    "--volterra-mode",
+    type=click.Choice(["auto", "on", "off"]),
+    default="auto",
+    show_default=True,
+    help="Volterra memory usage for adaptive attack (auto=characterization driven)",
+)
+@click.option(
+    "--volterra-kernel",
+    type=click.Choice(["power_law", "exponential", "uniform"]),
+    default="power_law",
+    show_default=True,
+    help="Volterra kernel family (used when volterra-mode != off)",
+)
+@click.option(
+    "--volterra-alpha",
+    type=float,
+    default=None,
+    help="Override alpha_volterra (otherwise use characterization-recommended value)",
+)
+@click.option(
+    "--volterra-memory-length",
+    type=int,
+    default=None,
+    help="Override memory length k (otherwise use characterization-recommended value)",
 )
 @click.option(
     "--epsilon",
@@ -305,6 +347,244 @@ def attack_cmd(ctx: click.Context, **kwargs) -> None:
     from .attack_cmd import run_attack
 
     run_attack(ctx, **kwargs)
+
+
+@cli.command("analyze")
+@click.option(
+    "--model",
+    "-m",
+    required=False,
+    type=str,
+    help="Optional model path or name (defaults to a bundled CIFAR-10 TorchScript model when available)",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    count=True,
+    help="Increase verbosity for this command",
+)
+@click.option(
+    "--dataset",
+    "-d",
+    required=True,
+    type=click.Choice(
+        ["cifar10", "cifar100", "imagenet", "imagenet100", "ember", "nuscenes", "custom"]
+    ),
+    help="Dataset name",
+)
+@click.option(
+    "--data-path",
+    type=click.Path(),
+    help="Optional dataset root override (built-in datasets can auto-download if omitted)",
+)
+@click.option(
+    "--labels-path",
+    type=click.Path(exists=True),
+    help="Path to nuScenes label map JSON (required for dataset=nuscenes)",
+)
+@click.option(
+    "--nuscenes-version",
+    type=str,
+    default="v1.0-mini",
+    show_default=True,
+    help="nuScenes version string (e.g., v1.0-mini, v1.0-trainval)",
+)
+@click.option("--defense", required=True, type=str, help="Defense name (e.g., jpeg, bitdepth, randsmooth, ...)")
+@click.option(
+    "--epsilon",
+    "-e",
+    type=float,
+    default=8 / 255,
+    help="Perturbation budget (default: 8/255 for Linf)",
+)
+@click.option(
+    "--norm",
+    type=click.Choice(["Linf", "L2", "L1"]),
+    default="Linf",
+    help="Lp norm for perturbation budget",
+)
+@click.option(
+    "--iterations",
+    "-n",
+    type=int,
+    default=100,
+    help="Number of attack iterations",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    type=int,
+    default=128,
+    help="Batch size for evaluation",
+)
+@click.option(
+    "--num-samples",
+    type=int,
+    default=1000,
+    help="Number of samples to attack",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default="results",
+    show_default=True,
+    help="Directory to write the default output JSON into",
+)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Output file for results (overrides --output-dir default naming)",
+)
+@click.option(
+    "--report/--no-report",
+    default=True,
+    help="Print findings to stdout",
+)
+@click.option(
+    "--no-progress",
+    is_flag=True,
+    help="Disable progress indicators",
+)
+@click.option(
+    "--device",
+    type=click.Choice(["cuda", "cpu", "mps", "auto"]),
+    default="auto",
+    help="Device for computation",
+)
+@click.option(
+    "--seed",
+    type=int,
+    default=42,
+    help="Random seed for reproducibility",
+)
+@click.pass_context
+def analyze_cmd(ctx: click.Context, **kwargs) -> None:
+    """
+    Paper-style alias for running a single adaptive evasion evaluation.
+
+    This wraps `neurinspectre attack` with `--attack-type neurinspectre` and a
+    default output location under `results/`.
+    """
+
+    import os
+    from pathlib import Path
+
+    def _normalize_defense_name(raw: str) -> str:
+        key = str(raw or "").strip().lower().replace("-", "_")
+        key = key.replace(" ", "_")
+        aliases = {
+            "jpeg_compression": "jpeg",
+            "jpegcompression": "jpeg",
+            "bit_depth": "bitdepth",
+            "bit_depth_reduction": "bitdepth",
+            "randomized_smoothing": "randsmooth",
+            "randsmoothing": "randsmooth",
+            "featsqueeze": "feature_squeezing",
+            "feature_squeeze": "feature_squeezing",
+            "featuresqueezing": "feature_squeezing",
+            "gradreg": "gradient_regularization",
+            "gradient_reg": "gradient_regularization",
+            "defensive_distillation": "distillation",
+            "distill": "distillation",
+            "at_transforms": "at_transform",
+            "at_transformations": "at_transform",
+            "spatial_smooth": "spatial_smoothing",
+            "randpadcrop": "random_pad_crop",
+            "randompadcrop": "random_pad_crop",
+            "certified": "certified_defense",
+        }
+        canonical = {
+            "none",
+            "jpeg",
+            "bitdepth",
+            "randsmooth",
+            "thermometer",
+            "distillation",
+            "ensemble",
+            "feature_squeezing",
+            "gradient_regularization",
+            "at_transform",
+            "spatial_smoothing",
+            "random_pad_crop",
+            "certified_defense",
+        }
+        key = aliases.get(key, key)
+        if key not in canonical:
+            raise click.ClickException(
+                "Unknown defense name for `analyze`: "
+                f"{raw!r}. Expected one of: {', '.join(sorted(canonical))}"
+            )
+        return key
+
+    dataset = str(kwargs.get("dataset"))
+    defense = _normalize_defense_name(str(kwargs.get("defense")))
+
+    model = kwargs.get("model")
+    if not model:
+        # Default bundled models (best-effort). For other datasets, require explicit model.
+        if dataset == "cifar10":
+            for cand in (
+                Path("models") / "cifar10_resnet20_norm_ts.pt",
+                Path("models") / "cifar10_cnn_ts.pt",
+            ):
+                if cand.exists():
+                    model = str(cand)
+                    break
+        if not model:
+            raise click.ClickException(
+                f"Missing --model and no default model found for dataset={dataset}. "
+                "Provide --model pointing to a local model artifact."
+            )
+
+    # Default output path under results/
+    output = kwargs.get("output")
+    if not output:
+        out_dir = Path(str(kwargs.get("output_dir") or "results"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output = out_dir / f"analyze_{dataset}_{defense}.json"
+    output = str(output)
+
+    # If user passed a data-path string that does not exist, do not fail at Click parsing time;
+    # let dataset loaders auto-download for supported datasets.
+    data_path = kwargs.get("data_path")
+    if data_path:
+        dp = Path(str(data_path))
+        if not dp.exists():
+            # Preserve the user intent but avoid a confusing "path must exist" error at CLI layer.
+            os.makedirs(dp, exist_ok=True)
+
+    from .attack_cmd import run_attack
+
+    run_attack(
+        ctx,
+        model=str(model),
+        verbose=kwargs.get("verbose", 0),
+        dataset=dataset,
+        data_path=data_path,
+        labels_path=kwargs.get("labels_path"),
+        nuscenes_version=kwargs.get("nuscenes_version"),
+        defense=defense,
+        defense_config=None,
+        attack_type="neurinspectre",
+        epsilon=float(kwargs.get("epsilon", 8 / 255)),
+        norm=str(kwargs.get("norm", "Linf")),
+        iterations=int(kwargs.get("iterations", 100)),
+        batch_size=int(kwargs.get("batch_size", 128)),
+        num_samples=int(kwargs.get("num_samples", 1000)),
+        targeted=False,
+        output=output,
+        report=bool(kwargs.get("report", True)),
+        report_format="text",
+        brief=False,
+        summary_only=False,
+        color=False,
+        no_color=False,
+        no_progress=bool(kwargs.get("no_progress", False)),
+        device=str(kwargs.get("device", "auto")),
+        seed=int(kwargs.get("seed", 42)),
+    )
 
 
 @cli.command("characterize")
@@ -669,10 +949,28 @@ def compare_cmd(ctx: click.Context, **kwargs) -> None:
     help="Resume interrupted evaluation",
 )
 @click.option(
+    "--smoke-test",
+    is_flag=True,
+    help="Run a minimal smoke subset (limits samples/iterations and selects 1 defense + 1 attack)",
+)
+@click.option(
     "--device",
     type=click.Choice(["cuda", "cpu", "mps", "auto"]),
     default="cuda",
     help="Device for computation",
+)
+@click.option(
+    "--seeds",
+    multiple=True,
+    type=int,
+    help="Run 3-5 independent seeds and report mean ± std (repeat flag)",
+)
+@click.option(
+    "--num-seeds",
+    type=int,
+    default=1,
+    show_default=True,
+    help="If >1 and --seeds not set: use [seed, seed+1, ...] from config seed",
 )
 @click.pass_context
 def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
@@ -840,6 +1138,19 @@ def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
     type=click.Choice(["cuda", "cpu", "mps", "auto"]),
     default="auto",
     help="Device for computation",
+)
+@click.option(
+    "--seeds",
+    multiple=True,
+    type=int,
+    help="Run 3-5 independent seeds and report mean ± std (repeat flag)",
+)
+@click.option(
+    "--num-seeds",
+    type=int,
+    default=1,
+    show_default=True,
+    help="If >1 and --seeds not set: use [seed, seed+1, ...] from config seed",
 )
 @click.pass_context
 def table2_cmd(ctx: click.Context, **kwargs) -> None:
@@ -1028,17 +1339,47 @@ def config_cmd(config_type: str, output: str | None) -> None:
         click.echo(config_str)
 
 
+# Baseline comparison harness (Issue 4).
+from .baselines_cmd import baselines_cmd as baselines_cli_cmd  # noqa: E402
+
+cli.add_command(baselines_cli_cmd)
+
+# Paper figure generation (Issue: paper figures -> reproducible CLI).
+from .figures_cmd import figures_cmd as figures_cli_cmd  # noqa: E402
+
+cli.add_command(figures_cli_cmd)
+
+
 def main() -> None:
     """Main CLI entry point"""
     try:
         argv = sys.argv[1:]
         if argv and argv[0] not in _CLICK_COMMANDS and argv[0] not in {"-h", "--help", "--version"}:
+            # AE/ops ergonomics: NeurInSpectre ships a large legacy argparse CLI
+            # (`neurinspectre.cli.__main__`) for several extended modules that are
+            # not yet ported to Click. For a small, explicit allowlist we delegate
+            # automatically (no env var required) so copy/paste reproduction commands
+            # work out of the box.
+            legacy_allowlist = {
+                # Argument names as users actually type them
+                "gradient-inversion",
+                "gradient_inversion",
+                "rl-obfuscation",
+                "attention-security",
+                "adversarial-ednn",
+                "subnetwork_hijack",
+                "statistical_evasion",
+                "statistical-evasion",
+                # Debug/infra helpers in legacy CLI
+                "gpu",
+                "obfuscated-gradient",
+            }
             enable_legacy = str(os.environ.get("NEURINSPECTRE_ENABLE_LEGACY_CLI", "")).lower() in {
                 "1",
                 "true",
                 "yes",
             }
-            if enable_legacy:
+            if enable_legacy or argv[0] in legacy_allowlist:
                 from .__main__ import main as legacy_main
 
                 legacy_main()

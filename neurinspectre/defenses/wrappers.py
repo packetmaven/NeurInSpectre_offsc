@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -374,20 +375,53 @@ class RandomizedSmoothingDefense(DefenseWrapper):
         return self.transform
 
     def certified_radius(self, x: torch.Tensor, n_samples: int = 1000) -> float:
+        """
+        Estimate a randomized-smoothing certified radius for a single sample.
+
+        Notes:
+        - This is a lightweight estimator used for diagnostics and failure analysis.
+        - `scipy.stats.norm.ppf(1.0)` is `inf`, so we clamp p_a away from 1.0.
+        """
         try:
             from scipy.stats import norm as _norm
         except Exception as exc:
             raise ImportError("scipy is required for certified radius computation") from exc
+
+        n_samples = int(n_samples)
+        if n_samples <= 0:
+            raise ValueError(f"n_samples must be >= 1, got {n_samples}")
+        if x.ndim == 0 or int(x.shape[0]) != 1:
+            raise ValueError("certified_radius expects a single input (batch_size==1).")
+
         counts = None
         with torch.no_grad():
             for _ in range(n_samples):
                 logits = self.base_model(self.transform(x))
                 preds = logits.argmax(dim=1)
                 if counts is None:
-                    counts = torch.zeros(logits.size(1), device=x.device)
-                counts[preds] += 1
-        p_a = (counts.max() / n_samples).item() if counts is not None else 0.0
-        return self.sigma * _norm.ppf(p_a) if p_a > 0.5 else 0.0
+                    if logits.ndim != 2 or int(logits.size(0)) != 1:
+                        raise ValueError(
+                            "certified_radius expects logits with shape (1, C). "
+                            f"Got shape={tuple(logits.shape)}"
+                        )
+                    counts = torch.zeros(int(logits.size(1)), device=x.device, dtype=torch.float32)
+                # Use scatter_add_ so repeated indices accumulate correctly.
+                counts.scatter_add_(0, preds.to(torch.int64), torch.ones_like(preds, dtype=counts.dtype))
+
+        if counts is None or float(counts.sum().item()) <= 0.0:
+            return 0.0
+
+        p_a = float((counts.max() / counts.sum()).item())
+        if p_a <= 0.5:
+            return 0.0
+
+        # Clamp away from {0,1} to keep ppf finite.
+        eps = 1e-6
+        p_a = max(0.5 + eps, min(p_a, 1.0 - eps))
+        radius = float(self.sigma) * float(_norm.ppf(p_a))
+        if (not math.isfinite(radius)) or radius < 0.0:
+            return 0.0
+        return float(radius)
 
 
 class RandomPadCropDefense(DefenseWrapper):
@@ -430,6 +464,83 @@ class RandomNoiseDefense(DefenseWrapper):
 
     def get_bpda_approximation(self) -> Callable[[torch.Tensor], torch.Tensor]:
         return self.noise_bpda
+
+
+class RLObfuscationDefense(DefenseWrapper):
+    """
+    Stateful, temporally correlated obfuscation defense (RL-style).
+
+    This wrapper is intentionally lightweight: it is meant for *decisive*
+    Volterra-memory experiments (Issue 6) and for exercising the
+    `ObfuscationType.RL_TRAINED` characterization path on real datasets.
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        *,
+        bits: int = 6,
+        std: float = 0.08,
+        alpha: float = 0.60,
+        n_samples: int = 32,
+        device: str = "cuda",
+    ):
+        spec = DefenseSpec(
+            name="rl_obfuscation",
+            domain="vision",
+            obfuscation_types=[ObfuscationType.SHATTERED, ObfuscationType.STOCHASTIC, ObfuscationType.RL_TRAINED],
+            params={
+                "bits": int(bits),
+                "std": float(std),
+                "alpha": float(alpha),
+                "n_samples": int(n_samples),
+            },
+            requires_bpda=True,
+            bpda_approximation="identity",
+            is_stochastic=True,
+            eot_samples=20,
+        )
+        super().__init__(base_model, spec, device)
+
+        self.bits = int(bits)
+        self.std = float(std)
+        self.alpha = float(alpha)
+        self.n_samples = int(n_samples)
+
+        # Use a straight-through estimator so gradients remain measurable for
+        # characterization (Volterra/autocorr). The attack still uses BPDA+EOT.
+        self._quant = BitDepthReduction(bits=self.bits, differentiable=True)
+        self._quant_bpda = self._quant.get_bpda_approximation()
+
+        # Internal state to induce temporal correlation (Volterra signature).
+        self._prev_noise: Optional[torch.Tensor] = None
+
+    def reset_state(self) -> None:
+        self._prev_noise = None
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        x_q = self._quant(x)
+        noise = torch.randn_like(x_q) * self.std
+        if self._prev_noise is not None and self._prev_noise.shape == noise.shape:
+            noise = self.alpha * self._prev_noise + (1.0 - self.alpha) * noise
+        self._prev_noise = noise.detach()
+        return torch.clamp(x_q + noise, 0.0, 1.0)
+
+    def get_bpda_approximation(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        # Deterministic approximation (no stochastic noise) for BPDA.
+        return self._quant_bpda
+
+    def forward(self, x: torch.Tensor, use_approximation: bool = False) -> torch.Tensor:
+        # Similar to randomized smoothing: average logits at eval-time to preserve
+        # clean accuracy under high noise, but keep a single-sample path when
+        # EOT is explicitly enabled.
+        if self._eot_enabled:
+            return self.base_model(self.transform(x))
+        logits_acc = None
+        for _ in range(self.n_samples):
+            logits = self.base_model(self.transform(x))
+            logits_acc = logits if logits_acc is None else logits_acc + logits
+        return logits_acc / float(max(1, self.n_samples))
 
 
 class EnsembleDiversityDefense(DefenseWrapper):

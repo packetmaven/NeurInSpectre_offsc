@@ -14,6 +14,7 @@ from .drift_detection_enhanced import (
     EnhancedDriftDetector,
     HotellingT2DriftDetector,
     KolmogorovSmirnovDriftDetector,
+    KSDADCvMDriftDetector,
     BayesianChangePointDetector,
     DriftDetectionResults,
     create_enhanced_drift_detector
@@ -27,6 +28,7 @@ __all__ = [
     'EnhancedDriftDetector',
     'HotellingT2DriftDetector',
     'KolmogorovSmirnovDriftDetector',
+    'KSDADCvMDriftDetector',
     'BayesianChangePointDetector',
     'DriftDetectionResults',
     'create_enhanced_drift_detector'
