@@ -40,10 +40,12 @@ MODEL_NAME = "Carmon2019Unlabeled"
 DATASET = "cifar10"
 THREAT_MODEL = "Linf"
 
-# Pin this after a successful first run: paste the value printed by this
-# script on success and commit the change to this file. Reviewers will then
-# get an integrity check for free.
-EXPECTED_SHA256: str | None = None
+# Pinned SHA256 of the Carmon2019Unlabeled Linf WRN-28-10 checkpoint used
+# to produce Table 5 in the paper. Reviewers downloading via this script
+# will get an automatic integrity check against this hash on completion.
+EXPECTED_SHA256: str | None = (
+    "f3ea703e4e98d26947bced9580f63922e31423233bbe45eebff8c7d45b7eacfc"
+)
 
 
 def _sha256_of(path: Path, chunk: int = 1 << 20) -> str:
