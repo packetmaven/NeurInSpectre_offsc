@@ -5,10 +5,9 @@ Obfuscation Detection in Adversarial Machine Learning"
 
 This is the fastest path for a CCS reviewer to verify this paper's results.
 A companion CCS '26 submission (the offensive framework paper) shares this
-codebase; its reproduction quickstart is at
-[QUICKSTART_CCS_OFFENSIVE.md](QUICKSTART_CCS_OFFENSIVE.md). For the full
-paper-element-to-command mapping across both papers, see
-[REPRODUCE.md](REPRODUCE.md).
+codebase and its reproduction artifacts are delivered separately per that
+submission's artifact-evaluation timeline. For the paper-element-to-command
+mapping used in this paper, see [REPRODUCE.md](REPRODUCE.md).
 
 ## 1. Install (5 min)
 
@@ -116,6 +115,7 @@ Figures 1, 2, 3, 5, 6, 7, 8 are static assets in `figures/`:
 This same repository supports reproduction of a companion CCS '26 submission
 on the offensive framework (7 attack modules + 12-defense evasion matrix).
 Those experiments use different commands (`neurinspectre table2`,
-`bash scripts/reproduce_table8.sh`, module-specific CLIs) and are documented
-in [QUICKSTART_CCS_OFFENSIVE.md](QUICKSTART_CCS_OFFENSIVE.md). They are
-**not** required to verify this (detection-framework) paper.
+`bash scripts/reproduce_table8.sh`, module-specific CLIs). They are
+**not** required to verify this (detection-framework) paper. Artifact
+documentation for the offensive paper is delivered separately per its
+artifact-evaluation timeline.

@@ -90,39 +90,42 @@ def main() -> int:
     dest_dir.mkdir(parents=True, exist_ok=True)
     target = dest_dir / f"{MODEL_NAME}.pt"
 
-    if target.exists() and not args.force:
-        print(f"[ok] Already exists: {target} ({target.stat().st_size / 1e6:.1f} MB)")
-        print(f"[ok] SHA256: {_sha256_of(target)}")
-        print("[ok] Use --force to re-download.")
-        return 0
+    file_was_present = target.exists() and not args.force
 
-    _ensure_robustbench()
-    from robustbench.utils import load_model
+    if file_was_present:
+        print(f"[ok] Already exists: {target} "
+              f"({target.stat().st_size / 1e6:.1f} MB)")
+    else:
+        _ensure_robustbench()
+        from robustbench.utils import load_model
 
-    print(f"[fetch] robustbench.load_model(model={MODEL_NAME}, "
-          f"dataset={DATASET}, threat={THREAT_MODEL}) ...")
-    load_model(
-        model_name=MODEL_NAME,
-        dataset=DATASET,
-        threat_model=THREAT_MODEL,
-        model_dir=str(dest_dir),
-    )
+        print(f"[fetch] robustbench.load_model(model={MODEL_NAME}, "
+              f"dataset={DATASET}, threat={THREAT_MODEL}) ...")
+        load_model(
+            model_name=MODEL_NAME,
+            dataset=DATASET,
+            threat_model=THREAT_MODEL,
+            model_dir=str(dest_dir),
+        )
 
-    if not target.exists():
-        # RobustBench may save under a subdirectory depending on version; locate it.
-        candidates = list(dest_dir.rglob(f"{MODEL_NAME}.pt"))
-        if not candidates:
-            print(f"[error] RobustBench did not place {MODEL_NAME}.pt under "
-                  f"{dest_dir}. Found instead:", file=sys.stderr)
-            for p in dest_dir.rglob("*"):
-                if p.is_file():
-                    print(f"  {p}", file=sys.stderr)
-            return 1
-        src = candidates[0]
-        if src != target:
-            shutil.copy2(src, target)
-            print(f"[ok] Copied {src} -> {target}")
+        if not target.exists():
+            # RobustBench may save under a subdirectory depending on version;
+            # locate it and copy to the expected path.
+            candidates = list(dest_dir.rglob(f"{MODEL_NAME}.pt"))
+            if not candidates:
+                print(f"[error] RobustBench did not place {MODEL_NAME}.pt under "
+                      f"{dest_dir}. Found instead:", file=sys.stderr)
+                for p in dest_dir.rglob("*"):
+                    if p.is_file():
+                        print(f"  {p}", file=sys.stderr)
+                return 1
+            src = candidates[0]
+            if src != target:
+                shutil.copy2(src, target)
+                print(f"[ok] Copied {src} -> {target}")
 
+    # Integrity check runs unconditionally so that reviewers who bring their
+    # own copy of the checkpoint (pre-existing file path) also get verified.
     size_mb = target.stat().st_size / 1e6
     sha = _sha256_of(target)
     print(f"[done] {target} ({size_mb:.1f} MB)")
@@ -132,12 +135,18 @@ def main() -> int:
         if sha.lower() != EXPECTED_SHA256.lower():
             print(f"[error] SHA256 mismatch! expected {EXPECTED_SHA256}",
                   file=sys.stderr)
+            print("[error] Re-run with --force to replace the file, or "
+                  "investigate whether RobustBench re-uploaded the checkpoint.",
+                  file=sys.stderr)
             return 2
         print("[ok] SHA256 matches pinned EXPECTED_SHA256.")
     else:
         print("[note] EXPECTED_SHA256 is not pinned in this script. "
               "Paste the hash above into EXPECTED_SHA256 and re-commit to "
               "give future reviewers an integrity check.")
+
+    if file_was_present:
+        print("[ok] Use --force to re-download.")
 
     return 0
 
