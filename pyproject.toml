@@ -5,8 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "neurinspectre"
 version = "2.0.0"
+# Anonymized for CCS '26 double-blind review. De-anonymize after acceptance.
 authors = [
-    {name = "NeurInSpectre Security Team", email = "contact@neurinspectre.dev"},
+    {name = "Anonymous", email = "anonymous@example.com"},
 ]
 description = "Neural Network Security Analysis Framework - Time Travel Debugger for AI/ML Model Security"
 readme = "README.md"
