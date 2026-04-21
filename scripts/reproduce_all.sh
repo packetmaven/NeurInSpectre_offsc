@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "=== NeurInSpectre Reproduction Script ==="
-echo "=== WOOT '26 Artifact Harness ==="
+echo "=== CCS '26 Artifact Harness ==="
 echo ""
 
 RESULTS_DIR="${RESULTS_DIR:-results/paper_$(date +%Y%m%d_%H%M%S)}"

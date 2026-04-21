@@ -296,6 +296,7 @@ adversarial_robustness_toolbox/
 !REPRODUCE.md
 !LICENSE.md
 !QUICKSTART_CCS.md
+!QUICKSTART_CCS_OFFENSIVE.md
 !docs/guides/*.md
 !docs/research/*.md
 !docs/README_INDEX.md
