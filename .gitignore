@@ -295,6 +295,7 @@ adversarial_robustness_toolbox/
 !README.md
 !REPRODUCE.md
 !LICENSE.md
+!QUICKSTART_CCS.md
 !docs/guides/*.md
 !docs/research/*.md
-!docs/README_INDEX.md DEVELOPMENT_NOTES.md
+!docs/README_INDEX.md
