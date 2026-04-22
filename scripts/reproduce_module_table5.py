@@ -96,53 +96,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # for sibling script i
 from neurinspectre.models.cifar10 import load_cifar10_model  # noqa: E402
 from neurinspectre.evaluation.datasets import CIFAR10Dataset  # noqa: E402
 
-# Reuse the WideResNet class defined in the detection-paper script so we
-# don't duplicate ~70 LOC. The key-remap below adapts the Carmon2019
-# checkpoint to this class's exact attribute layout.
-from run_real_defense_experiments import WideResNet  # noqa: E402
-
-
-def load_carmon2019(checkpoint_path: str, device: str) -> nn.Module:
-    """Load Carmon2019Unlabeled WRN-28-10 correctly.
-
-    The RobustBench checkpoint stores keys as ``module.block{i}.layer.{j}.*``
-    but our ``WideResNet`` builds its layers via ``nn.Sequential`` producing
-    ``block{i}.{j}.*``. We rewrite the keys accordingly and drop the
-    unused ``sub_block1.*`` auxiliary branch.
-    """
-    import re
-    from collections import OrderedDict
-
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-
-    new_sd = OrderedDict()
-    pat = re.compile(r"^module\.(block[123])\.layer\.(\d+)\.(.+)$")
-    for k, v in sd.items():
-        if k.startswith("module.sub_block"):
-            continue
-        m = pat.match(k)
-        if m:
-            new_k = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
-        elif k.startswith("module."):
-            new_k = k[len("module."):]
-        else:
-            new_k = k
-        # Shortcut rename: checkpoint uses `convShortcut.weight`; our
-        # class uses `shortcut.0.weight` (Sequential wrapping a single Conv2d).
-        new_k = new_k.replace(".convShortcut.", ".shortcut.0.")
-        new_sd[new_k] = v
-
-    model = WideResNet(depth=28, widen_factor=10, num_classes=10)
-    missing, unexpected = model.load_state_dict(new_sd, strict=False)
-    if missing:
-        print(f"[carmon-loader] missing keys: {len(missing)} "
-              f"(first 3: {missing[:3]})")
-    if unexpected:
-        print(f"[carmon-loader] unexpected keys: {len(unexpected)} "
-              f"(first 3: {unexpected[:3]})")
-    model = model.to(device).eval()
-    return model
+# Reuse the canonical Carmon2019 loader from the detection-paper script.
+# That loader uses RobustBench's ``load_model`` (the only path that achieves
+# the published 89.7% clean accuracy; the previous custom-WideResNet path
+# silently produced ~10-81% due to architectural mismatches).
+from run_real_defense_experiments import load_carmon2019  # noqa: E402
 
 
 TRIGGER_SIZE = 3
