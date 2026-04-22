@@ -252,7 +252,9 @@ results/
 *.safetensors
 *.bin
 !neurinspectre/**/*.py
-models/
+# Top-level models/ dir (large .pt checkpoints); NOT neurinspectre/models/
+# which is a source-code package.
+/models/
 checkpoints/
 data/large_datasets/
 *.model
