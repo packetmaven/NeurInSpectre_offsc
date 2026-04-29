@@ -252,7 +252,9 @@ results/
 *.safetensors
 *.bin
 !neurinspectre/**/*.py
-models/
+# Top-level models/ dir (large .pt checkpoints); NOT neurinspectre/models/
+# which is a source-code package.
+/models/
 checkpoints/
 data/large_datasets/
 *.model
@@ -288,6 +290,7 @@ dataset_cache/
 *.tar.gz
 *.tar
 *.gz
+*.tgz
 adversarial_robustness_toolbox/
 
 # Exclude all markdown documentation except essential READMEs
@@ -295,6 +298,31 @@ adversarial_robustness_toolbox/
 !README.md
 !REPRODUCE.md
 !LICENSE.md
+!AE.md
+!DRAFT_CODE_AUDIT.md
 !docs/guides/*.md
 !docs/research/*.md
-!docs/README_INDEX.md DEVELOPMENT_NOTES.md
+!docs/README_INDEX.md
+!DEVELOPMENT_NOTES.md
+
+# Allowlisting a small set of Table 8 model artifacts + metadata (for AE reproducibility).
+# Everything else under models/ remains ignored by the patterns above.
+!models/
+models/checkpoints/
+models/weights/
+models/cifar10/
+!models/cifar10_resnet20_norm_ts.pt
+!models/cifar10_resnet20_norm_ts.pt.meta.json
+!models/ember_mlp_ts.pt
+!models/ember_mlp_ts.pt.meta.json
+!models/md_gradient_reg_ember_ts.pt
+!models/md_gradient_reg_ember_ts.pt.meta.json
+!models/md_distillation_ember_ts.pt
+!models/md_distillation_ember_ts.pt.meta.json
+!models/md_at_transform_ember_ts.pt
+!models/md_at_transform_ember_ts.pt.meta.json
+!models/nuscenes_resnet18_trained.pt
+!models/nuscenes_resnet18_trained.pt.meta.json
+
+# Unit-test fixture (small) needed for repo tests.
+!tests/fixtures/test_model.pth
