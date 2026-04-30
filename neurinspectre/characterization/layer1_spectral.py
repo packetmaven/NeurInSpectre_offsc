@@ -41,8 +41,35 @@ def compute_spectral_features(
     hf_energy = float(np.sum(psd[hf_mask]))
     high_freq_ratio = float(hf_energy / psd_sum)
 
+    # Draft Section 3.1: Morlet CWT energy at octave-ish scales {2,4,8,16}.
+    #
+    # We implement a small, dependency-free approximation via discrete convolution
+    # (Gaussian-windowed cosine). This is intentionally lightweight: Layer-1 uses
+    # short gradient sequences (T~50-200) and the goal is an auditable scalar
+    # signature rather than a full time-frequency map.
+    def _morlet_energy_1d(x: np.ndarray, *, scales: list[float], w0: float = 5.0) -> dict[str, float]:
+        out: dict[str, float] = {}
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        for s in scales:
+            scale = float(s)
+            sigma = scale / float(fs)
+            t_max = max(int(np.ceil(4.0 * sigma * float(fs))), 1)
+            t = np.arange(-t_max, t_max + 1, dtype=np.float64) / float(fs)
+            kernel = np.exp(-(t**2) / (2.0 * sigma**2)) * np.cos(float(w0) * t / scale)
+            kernel = kernel / (float(np.linalg.norm(kernel)) + 1e-12)
+            # "Same" convolution with stable centering even when len(kernel) > len(x).
+            full = np.convolve(x, kernel, mode="full")
+            k = int(kernel.size)
+            start = (k - 1) // 2
+            conv = full[start : start + x.size]
+            out[f"scale_{int(scale)}"] = float(np.mean(np.abs(conv) ** 2))
+        return out
+
+    wavelet_energy = _morlet_energy_1d(arr, scales=[2.0, 4.0, 8.0, 16.0], w0=5.0)
+
     return {
         "spectral_entropy": spectral_entropy,
         "spectral_entropy_norm": spectral_entropy_norm,
         "high_freq_ratio": high_freq_ratio,
+        "wavelet_energy": wavelet_energy,
     }

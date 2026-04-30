@@ -1,0 +1,52 @@
+seed: 42
+
+# Keep this config fast enough for laptops (MPS/CPU) while still exercising the
+# exact Table-8-style attack trio codepaths.
+attack_batch_size: 64
+strict_dataset_budgets: true
+
+attack_budgets:
+  cifar10:
+    norm: linf
+    eps: 0.03137254901960784  # 8/255
+
+datasets:
+  cifar10:
+    path: ./data/cifar10
+    split: test
+    num_samples: 200
+    batch_size: 64
+    num_workers: 0
+    shuffle_eval: false
+
+models:
+  cifar10: models/cifar10_resnet20_norm_ts.pt
+
+defenses:
+  - name: cm_jpeg_compression
+    type: jpeg_compression
+    dataset: cifar10
+    params:
+      quality: 75
+
+attacks:
+  - name: pgd
+    steps: 20
+    step_size: 0.00784313725490196  # 2/255
+    random_start: true
+
+  - name: autoattack
+    version: standard
+
+  - name: neurinspectre
+    characterization_samples: 50
+
+validity_gates:
+  enabled: true
+  strict: true
+  min_clean_accuracy: 0.05
+  min_correct_samples: 5
+  min_correct_fraction: 0.1
+  min_clean_accuracy_over_chance: 0.05
+  require_label_map_sha256_match: true
+

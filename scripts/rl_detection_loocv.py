@@ -604,6 +604,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Disable feature cache (default: cache enabled)",
     )
+    p.add_argument(
+        "--export-srl-weights",
+        default=None,
+        help=(
+            "Optional path to write a deployable SRL weights JSON "
+            "(logistic regression over component scores). If relative, it is "
+            "written under --output-dir."
+        ),
+    )
     args = p.parse_args(list(argv) if argv is not None else None)
 
     input_root = Path(str(args.input_root)).expanduser().resolve()
@@ -653,6 +662,80 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 target_fpr=float(args.target_fpr),
             )
         )
+
+    exported_srl_weights_path = None
+    if args.export_srl_weights:
+        # Train a single deployable calibration model on *all* samples.
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.pipeline import Pipeline
+            from sklearn.preprocessing import StandardScaler
+        except Exception as exc:
+            raise SystemExit("[loocv] scikit-learn required for SRL weight export. Error: " + str(exc)) from exc
+
+        X_all = np.asarray([r.features for r in rows], dtype=np.float64)
+        y_all = np.asarray([r.sample.y for r in rows], dtype=int)
+
+        clf = Pipeline(
+            steps=[
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                (
+                    "logreg",
+                    LogisticRegression(
+                        penalty="l2",
+                        C=1.0,
+                        class_weight="balanced",
+                        solver="liblinear",
+                        max_iter=2000,
+                        random_state=int(args.seed),
+                    ),
+                ),
+            ]
+        )
+        clf.fit(X_all, y_all)
+        p_all = clf.predict_proba(X_all)[:, 1]
+        thr_all = _choose_threshold(
+            y_all,
+            p_all,
+            strategy=str(args.threshold_strategy),
+            fixed_threshold=float(args.fixed_threshold),
+            target_fpr=float(args.target_fpr),
+        )
+
+        lr = clf.named_steps["logreg"]
+        scaler = clf.named_steps["scaler"]
+        coef = [float(x) for x in lr.coef_.reshape(-1).tolist()]
+        intercept = float(lr.intercept_.reshape(-1)[0])
+        weights_obj = {
+            "type": "logistic_regression",
+            "feature_names": list(FEATURE_NAMES),
+            "coef": coef,
+            "intercept": intercept,
+            "threshold": float(thr_all),
+            "scaler": {
+                "mean": [float(x) for x in scaler.mean_.reshape(-1).tolist()],
+                "scale": [float(x) for x in scaler.scale_.reshape(-1).tolist()],
+            },
+            "trained_on": {
+                "input_root": str(input_root),
+                "algorithms": list(algorithms),
+                "pos_dir": str(args.pos_dir),
+                "neg_dir": str(args.neg_dir),
+                "pattern": str(args.pattern),
+                "sensitivity": str(args.sensitivity),
+                "seed": int(args.seed),
+                "threshold_strategy": str(args.threshold_strategy),
+                "fixed_threshold": float(args.fixed_threshold),
+                "target_fpr": float(args.target_fpr),
+            },
+        }
+
+        outp = Path(str(args.export_srl_weights))
+        if not outp.is_absolute():
+            outp = output_dir / outp
+        _write_json(outp, weights_obj)
+        exported_srl_weights_path = str(outp)
+        print(f"[loocv] Exported SRL weights: {outp}")
 
     # Aggregate (mean ± std) across 4 folds.
     def _collect(metric_key: str, *, section: str) -> List[Optional[float]]:
@@ -704,6 +787,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         "folds": fold_results,
         "aggregate_across_folds": agg,
+        "exported_srl_weights": exported_srl_weights_path,
     }
 
     out_path = output_dir / "rl_detection_loocv.json"

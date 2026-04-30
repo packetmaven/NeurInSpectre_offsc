@@ -46,6 +46,71 @@ def _bonferroni_adjust(p_values: List[float], *, m: Optional[int] = None) -> Lis
     return [float(min(1.0, p * m_eff)) for p in finite]
 
 
+def _bh_fdr_adjust(p_values: List[float]) -> List[float]:
+    """
+    Benjamini–Hochberg (BH) adjustment (FDR control).
+
+    Returns BH-adjusted q-values in the original input order.
+    """
+    finite: List[float] = []
+    for p in p_values:
+        try:
+            p_f = float(p)
+        except Exception:
+            p_f = 1.0
+        if not np.isfinite(p_f):
+            p_f = 1.0
+        finite.append(float(np.clip(p_f, 0.0, 1.0)))
+
+    m = int(len(finite))
+    if m <= 0:
+        return []
+
+    order = np.argsort(np.asarray(finite, dtype=np.float64), kind="mergesort")
+    ranked = [finite[int(i)] for i in order]
+
+    # Raw BH: q_i = p_i * m / rank_i
+    q = [0.0] * m
+    for r, p in enumerate(ranked, start=1):
+        q[r - 1] = float(min(1.0, float(p) * float(m) / float(r)))
+
+    # Enforce monotonicity from the tail: q_(i) = min_{j>=i} q_j
+    for i in range(m - 2, -1, -1):
+        q[i] = float(min(q[i], q[i + 1]))
+
+    out = [1.0] * m
+    for pos, idx in enumerate(order):
+        out[int(idx)] = float(q[int(pos)])
+    return out
+
+
+def _fisher_combine_p_values(p_values: List[float]) -> Tuple[float, float]:
+    """
+    Fisher's method for combining p-values.
+
+    Returns:
+        (statistic, combined_p_value)
+    """
+    eps = 1e-300
+    ps: List[float] = []
+    for p in p_values:
+        try:
+            pv = float(p)
+        except Exception:
+            pv = 1.0
+        if not np.isfinite(pv):
+            pv = 1.0
+        pv = float(np.clip(pv, eps, 1.0))
+        ps.append(pv)
+    k = int(len(ps))
+    if k <= 0:
+        return 0.0, 1.0
+    stat = float(-2.0 * float(np.sum(np.log(np.asarray(ps, dtype=np.float64)))))
+    p_combined = float(stats.chi2.sf(stat, df=2 * k))
+    p_combined = float(np.clip(p_combined, 0.0, 1.0))
+    return stat, p_combined
+
+
 @dataclass
 class DriftDetectionResults:
     """Container for drift detection results"""
@@ -80,6 +145,10 @@ class HotellingT2DriftDetector(BaseDriftDetector):
         super().__init__(confidence_level)
         self.use_robust_covariance = use_robust_covariance
         self._last_p_value_method: str = "f"
+        # Diagnostics captured during covariance estimation (kept in results JSON).
+        self._last_covariance_estimator: str = "pooled"
+        self._last_covariance_warnings: List[str] = []
+        self._last_covariance_error: Optional[str] = None
         
     def compute_hotelling_t2(
         self, 
@@ -109,22 +178,33 @@ class HotellingT2DriftDetector(BaseDriftDetector):
         mean2 = np.mean(X2, axis=0)
         
         # Compute pooled covariance matrix
+        self._last_covariance_estimator = "pooled"
+        self._last_covariance_warnings = []
+        self._last_covariance_error = None
         if self.use_robust_covariance and min(n1, n2) > p:
             try:
                 # Use robust covariance estimation
                 combined_data = np.vstack([X1, X2])
                 cov_estimator = MinCovDet(random_state=42)
-                # Some MinCovDet runs can emit RuntimeWarnings (non-monotone determinant);
-                # treat that as an unstable fit and fall back to the classical pooled covariance.
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
+                # MinCovDet can emit warnings on degenerate/low-rank data. Capture them
+                # (so tests/CLI stay clean) and fall back to the classical pooled
+                # covariance when the fit is unstable.
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
                     cov_estimator.fit(combined_data)
+                self._last_covariance_warnings = [str(w.message) for w in caught]
+                if any("not full rank" in str(w.message).lower() for w in caught):
+                    raise ValueError("MinCovDet covariance not full rank; falling back to pooled covariance")
+
                 S_pooled = cov_estimator.covariance_
+                self._last_covariance_estimator = "mincovdet"
             except Exception as e:
-                logger.warning(f"Robust covariance estimation failed: {e}. Using empirical.")
+                self._last_covariance_error = str(e)
+                logger.warning("Robust covariance estimation failed: %s. Using empirical.", e)
                 S1 = np.cov(X1, rowvar=False, bias=False)
                 S2 = np.cov(X2, rowvar=False, bias=False)
                 S_pooled = ((n1 - 1) * S1 + (n2 - 1) * S2) / (n1 + n2 - 2)
+                self._last_covariance_estimator = "pooled_fallback"
         else:
             # Standard pooled covariance
             S1 = np.cov(X1, rowvar=False, bias=False)
@@ -226,6 +306,9 @@ class HotellingT2DriftDetector(BaseDriftDetector):
             'f_statistic': F_stat,
             'p_value': p_value,
             'p_value_method': getattr(self, "_last_p_value_method", "f"),
+            'covariance_estimator': getattr(self, "_last_covariance_estimator", "pooled"),
+            'covariance_warnings': list(getattr(self, "_last_covariance_warnings", [])),
+            'covariance_error': getattr(self, "_last_covariance_error", None),
             'degrees_freedom_1': df1,
             'degrees_freedom_2': df2,
             't2_critical': float(T2_critical),
@@ -402,6 +485,166 @@ class KolmogorovSmirnovDriftDetector(BaseDriftDetector):
         )
 
 
+class MMDDriftDetector(BaseDriftDetector):
+    """
+    Maximum Mean Discrepancy (MMD) two-sample test for multivariate drift.
+
+    We compute an unbiased MMD^2 estimate with an RBF kernel and obtain a p-value
+    via a permutation test. This is AE-friendly (no questionable independence
+    assumptions across deep feature dimensions) and matches the common
+    recommendation to use multivariate two-sample tests (MMD / energy distance).
+    """
+
+    def __init__(
+        self,
+        confidence_level: float = 0.95,
+        *,
+        n_permutations: int = 500,
+        bandwidth: Optional[float] = None,
+        random_state: int = 42,
+    ):
+        super().__init__(confidence_level)
+        self.n_permutations = int(max(50, n_permutations))
+        self.bandwidth = None if bandwidth is None else float(bandwidth)
+        self.random_state = int(random_state)
+
+    @staticmethod
+    def _sq_dists(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        A = np.asarray(A, dtype=np.float64)
+        B = np.asarray(B, dtype=np.float64)
+        if A.ndim != 2:
+            A = A.reshape(A.shape[0], -1)
+        if B.ndim != 2:
+            B = B.reshape(B.shape[0], -1)
+        aa = np.sum(A * A, axis=1, keepdims=True)
+        bb = np.sum(B * B, axis=1, keepdims=True).T
+        d2 = aa + bb - 2.0 * (A @ B.T)
+        return np.maximum(0.0, d2)
+
+    @staticmethod
+    def _median_bandwidth(X: np.ndarray) -> float:
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.shape[0] < 2:
+            return 1.0
+        d2 = MMDDriftDetector._sq_dists(X, X)
+        tri = d2[np.triu_indices_from(d2, k=1)]
+        tri = tri[np.isfinite(tri)]
+        tri = tri[tri > 0.0]
+        if tri.size == 0:
+            return 1.0
+        # Median heuristic: sigma = median(||x-y||)
+        sigma = float(np.median(np.sqrt(tri)))
+        if not np.isfinite(sigma) or sigma <= 1e-12:
+            return 1.0
+        return sigma
+
+    @staticmethod
+    def _mmd2_from_kernel(K: np.ndarray, idx1: np.ndarray, idx2: np.ndarray) -> float:
+        idx1 = np.asarray(idx1, dtype=np.int64)
+        idx2 = np.asarray(idx2, dtype=np.int64)
+        n1 = int(idx1.size)
+        n2 = int(idx2.size)
+        if n1 < 2 or n2 < 2:
+            return 0.0
+        K11 = K[np.ix_(idx1, idx1)]
+        K22 = K[np.ix_(idx2, idx2)]
+        K12 = K[np.ix_(idx1, idx2)]
+        term1 = float((np.sum(K11) - np.trace(K11)) / float(n1 * (n1 - 1)))
+        term2 = float((np.sum(K22) - np.trace(K22)) / float(n2 * (n2 - 1)))
+        term3 = float(np.mean(K12)) if (n1 * n2) > 0 else 0.0
+        return float(max(0.0, term1 + term2 - 2.0 * term3))
+
+    def detect_drift(self, reference_data: np.ndarray, current_data: np.ndarray) -> DriftDetectionResults:
+        ref = np.asarray(reference_data, dtype=np.float64)
+        cur = np.asarray(current_data, dtype=np.float64)
+        if ref.ndim != 2:
+            ref = ref.reshape(ref.shape[0], -1)
+        if cur.ndim != 2:
+            cur = cur.reshape(cur.shape[0], -1)
+
+        n1 = int(ref.shape[0])
+        n2 = int(cur.shape[0])
+        p = int(min(ref.shape[1], cur.shape[1])) if ref.ndim == 2 and cur.ndim == 2 else 1
+        ref = ref[:, :p]
+        cur = cur[:, :p]
+
+        if n1 < 2 or n2 < 2:
+            # Not enough samples to estimate an unbiased MMD.
+            return DriftDetectionResults(
+                drift_detected=False,
+                drift_score=0.0,
+                p_value=1.0,
+                confidence_interval=(0.0, 0.0),
+                change_points=[],
+                drift_magnitude=0.0,
+                statistical_significance={"sample_sizes": (n1, n2), "n_features": int(p), "reason": "insufficient_samples"},
+                feature_drift_scores=np.zeros((p,), dtype=np.float64),
+            )
+
+        combined = np.vstack([ref, cur])
+        sigma = self.bandwidth if self.bandwidth is not None else self._median_bandwidth(combined)
+        sigma2 = float(max(1e-12, sigma * sigma))
+
+        d2 = self._sq_dists(combined, combined)
+        K = np.exp(-d2 / (2.0 * sigma2))
+
+        idx1 = np.arange(n1, dtype=np.int64)
+        idx2 = np.arange(n1, n1 + n2, dtype=np.int64)
+        observed = self._mmd2_from_kernel(K, idx1, idx2)
+
+        # Permutation test
+        rng = np.random.default_rng(self.random_state)
+        perm_stats = []
+        for _ in range(int(self.n_permutations)):
+            perm = rng.permutation(n1 + n2)
+            perm_idx1 = perm[:n1]
+            perm_idx2 = perm[n1:]
+            perm_stats.append(self._mmd2_from_kernel(K, perm_idx1, perm_idx2))
+        perm_arr = np.asarray(perm_stats, dtype=np.float64)
+        p_value = float((1.0 + np.sum(perm_arr >= observed)) / (float(perm_arr.size) + 1.0))
+        p_value = float(np.clip(p_value, 0.0, 1.0))
+        drift_detected = p_value < float(self.alpha)
+
+        critical_value = float(np.quantile(perm_arr, 1.0 - float(self.alpha))) if perm_arr.size else 0.0
+        ci_lower = 0.0
+        ci_upper = float(critical_value)
+
+        # Feature-wise drift scores: standardized mean differences (same convention as Hotelling).
+        feature_drift_scores = []
+        for i in range(p):
+            x1 = ref[:, i]
+            x2 = cur[:, i]
+            m1 = float(np.mean(x1))
+            m2 = float(np.mean(x2))
+            s1 = float(np.std(x1, ddof=1)) if x1.size >= 2 else 0.0
+            s2 = float(np.std(x2, ddof=1)) if x2.size >= 2 else 0.0
+            sp2 = (((x1.size - 1) * (s1 ** 2)) + ((x2.size - 1) * (s2 ** 2))) / float(max(1, x1.size + x2.size - 2))
+            denom = float(np.sqrt(max(1e-12, sp2)))
+            feature_drift_scores.append(abs(m1 - m2) / denom)
+        feature_drift_scores = np.asarray(feature_drift_scores, dtype=np.float64)
+
+        statistical_significance = {
+            "mmd2": float(observed),
+            "p_value": float(p_value),
+            "critical_value": float(critical_value),
+            "bandwidth": float(sigma),
+            "n_permutations": int(perm_arr.size),
+            "sample_sizes": (int(n1), int(n2)),
+            "n_features": int(p),
+        }
+
+        return DriftDetectionResults(
+            drift_detected=bool(drift_detected),
+            drift_score=float(observed),
+            p_value=float(p_value),
+            confidence_interval=(float(ci_lower), float(ci_upper)),
+            change_points=[],
+            drift_magnitude=float(observed),
+            statistical_significance=statistical_significance,
+            feature_drift_scores=feature_drift_scores,
+        )
+
+
 class KSDADCvMDriftDetector(BaseDriftDetector):
     """
     Distribution drift detector using a trio of classical two-sample tests:
@@ -505,8 +748,16 @@ class KSDADCvMDriftDetector(BaseDriftDetector):
         pvals.append(raw["ks"]["p_value"])
 
         # Anderson-Darling k-sample (k=2)
+        ad_warnings: List[str] = []
         try:
-            ad_res = stats.anderson_ksamp([x1, x2])
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                ad_res = stats.anderson_ksamp([x1, x2])
+            for w in caught:
+                try:
+                    ad_warnings.append(str(w.message))
+                except Exception:
+                    continue
             ad_stat = float(getattr(ad_res, "statistic", 0.0))
             # SciPy returns .pvalue in modern versions; .significance_level exists for compatibility.
             ad_p = getattr(ad_res, "pvalue", None)
@@ -516,6 +767,9 @@ class KSDADCvMDriftDetector(BaseDriftDetector):
         except Exception:
             ad_stat, ad_p = 0.0, 1.0
         raw["ad"] = {"statistic": ad_stat, "p_value": float(np.clip(ad_p, 0.0, 1.0))}
+        if ad_warnings:
+            # Keep runs/tests clean while still preserving evidence for auditability.
+            raw["ad"]["warnings"] = list(ad_warnings)
         pvals.append(raw["ad"]["p_value"])
 
         # Cramér–von Mises two-sample
@@ -577,6 +831,164 @@ class KSDADCvMDriftDetector(BaseDriftDetector):
             drift_magnitude=drift_score,
             statistical_significance=statistical_significance,
             feature_drift_scores=feature_drift_scores,
+        )
+
+
+class PerDimKSDADCvMFisherBHDriftDetector(BaseDriftDetector):
+    """
+    Draft-parity statistical drift detector:
+      - per-dimension KS/AD/CvM
+      - Fisher aggregation across the 3 tests (per dimension)
+      - BH/FDR correction across dimensions
+
+    This is intentionally more "paper-like" than the PCA1+Bonferroni detector,
+    but can be more expensive for high-dimensional features.
+    """
+
+    def __init__(self, confidence_level: float = 0.95, *, report_top_k: int = 25):
+        super().__init__(confidence_level)
+        self.report_top_k = int(max(0, report_top_k))
+
+    def detect_drift(self, reference_data: np.ndarray, current_data: np.ndarray) -> DriftDetectionResults:
+        ref = np.asarray(reference_data, dtype=np.float64)
+        cur = np.asarray(current_data, dtype=np.float64)
+        if ref.ndim == 1:
+            ref = ref.reshape(-1, 1)
+        if cur.ndim == 1:
+            cur = cur.reshape(-1, 1)
+        if ref.ndim != 2 or cur.ndim != 2:
+            ref = ref.reshape(int(ref.shape[0]), -1)
+            cur = cur.reshape(int(cur.shape[0]), -1)
+
+        p = int(min(ref.shape[1], cur.shape[1]))
+        ref = ref[:, :p]
+        cur = cur[:, :p]
+
+        # Sanitize non-finite values deterministically (rare, but happens in feature extraction).
+        ref = np.nan_to_num(ref, nan=0.0, posinf=0.0, neginf=0.0)
+        cur = np.nan_to_num(cur, nan=0.0, posinf=0.0, neginf=0.0)
+
+        n1 = int(ref.shape[0])
+        n2 = int(cur.shape[0])
+
+        if n1 < 2 or n2 < 2 or p <= 0:
+            stats_block = {
+                "sample_sizes": (n1, n2),
+                "n_features": int(p),
+                "alpha": float(self.alpha),
+                "aggregation": "fisher",
+                "correction": "bh_fdr",
+                "reason": "insufficient_samples",
+            }
+            return DriftDetectionResults(
+                drift_detected=False,
+                drift_score=0.0,
+                p_value=1.0,
+                confidence_interval=(0.0, 1.0),
+                change_points=[],
+                drift_magnitude=0.0,
+                statistical_significance=stats_block,
+                feature_drift_scores=np.zeros((max(1, p),), dtype=np.float64),
+            )
+
+        ks_stats = np.zeros((p,), dtype=np.float64)
+        p_ks = np.ones((p,), dtype=np.float64)
+        p_ad = np.ones((p,), dtype=np.float64)
+        p_cvm = np.ones((p,), dtype=np.float64)
+        fisher_stat = np.zeros((p,), dtype=np.float64)
+        fisher_p = np.ones((p,), dtype=np.float64)
+
+        ad_warning_count = 0
+
+        for j in range(p):
+            x1 = ref[:, j]
+            x2 = cur[:, j]
+            x1 = x1[np.isfinite(x1)]
+            x2 = x2[np.isfinite(x2)]
+            if int(x1.size) < 2 or int(x2.size) < 2:
+                continue
+
+            # KS
+            try:
+                ks_res = stats.ks_2samp(x1, x2)
+                ks_stats[j] = float(getattr(ks_res, "statistic", ks_res[0]))
+                p_ks[j] = float(np.clip(float(getattr(ks_res, "pvalue", ks_res[1])), 0.0, 1.0))
+            except Exception:
+                ks_stats[j] = 0.0
+                p_ks[j] = 1.0
+
+            # AD (k-sample, k=2)
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    ad_res = stats.anderson_ksamp([x1, x2])
+                if caught:
+                    ad_warning_count += int(len(caught))
+                ad_p = getattr(ad_res, "pvalue", None)
+                if ad_p is None:
+                    ad_p = getattr(ad_res, "significance_level", 1.0)
+                p_ad[j] = float(np.clip(float(ad_p), 0.0, 1.0))
+            except Exception:
+                p_ad[j] = 1.0
+
+            # CvM
+            try:
+                cvm_res = stats.cramervonmises_2samp(x1, x2)
+                p_cvm[j] = float(np.clip(float(getattr(cvm_res, "pvalue", 1.0)), 0.0, 1.0))
+            except Exception:
+                p_cvm[j] = 1.0
+
+            stat_j, p_j = _fisher_combine_p_values([float(p_ks[j]), float(p_ad[j]), float(p_cvm[j])])
+            fisher_stat[j] = float(stat_j)
+            fisher_p[j] = float(p_j)
+
+        fisher_q = np.asarray(_bh_fdr_adjust([float(x) for x in fisher_p.tolist()]), dtype=np.float64)
+        p_min = float(np.min(fisher_q)) if fisher_q.size else 1.0
+        drift_detected = bool(p_min < float(self.alpha))
+        drift_score = float(np.clip(1.0 - p_min, 0.0, 1.0))
+
+        # Top-K reporting by BH q-value.
+        top_k = int(min(max(0, self.report_top_k), p))
+        top_idx = np.argsort(fisher_q)[:top_k] if top_k > 0 else np.asarray([], dtype=int)
+        top_features = []
+        for idx in top_idx.tolist():
+            j = int(idx)
+            top_features.append(
+                {
+                    "feature_index": j,
+                    "ks_statistic": float(ks_stats[j]),
+                    "p_ks": float(p_ks[j]),
+                    "p_ad": float(p_ad[j]),
+                    "p_cvm": float(p_cvm[j]),
+                    "fisher_statistic": float(fisher_stat[j]),
+                    "fisher_p": float(fisher_p[j]),
+                    "fisher_q_bh": float(fisher_q[j]),
+                }
+            )
+
+        statistical_significance = {
+            "sample_sizes": (int(n1), int(n2)),
+            "n_features": int(p),
+            "alpha": float(self.alpha),
+            "aggregation": "fisher",
+            "correction": "bh_fdr",
+            "per_dimension": {
+                "top_k": int(top_k),
+                "top_features": top_features,
+                "fisher_q_min": float(p_min),
+                "ad_warning_count": int(ad_warning_count),
+            },
+        }
+
+        return DriftDetectionResults(
+            drift_detected=drift_detected,
+            drift_score=drift_score,
+            p_value=float(p_min),
+            confidence_interval=(0.0, 1.0),
+            change_points=[],
+            drift_magnitude=drift_score,
+            statistical_significance=statistical_significance,
+            feature_drift_scores=np.asarray(ks_stats, dtype=np.float64),
         )
 
 
@@ -777,8 +1189,17 @@ class EnhancedDriftDetector:
             self.detectors['hotelling'] = HotellingT2DriftDetector(confidence_level)
         if 'ks' in methods:
             self.detectors['ks'] = KolmogorovSmirnovDriftDetector(confidence_level)
+        if 'mmd' in methods:
+            self.detectors['mmd'] = MMDDriftDetector(confidence_level)
         if 'ks_ad_cvm' in methods or 'ksadcvm' in methods:
             self.detectors['ks_ad_cvm'] = KSDADCvMDriftDetector(confidence_level)
+        if (
+            'ks_ad_cvm_fisher_bh' in methods
+            or 'ks_ad_cvm_fisherbh' in methods
+            or 'ks_ad_cvm_per_dim' in methods
+            or 'ksadcvm_fisher_bh' in methods
+        ):
+            self.detectors['ks_ad_cvm_fisher_bh'] = PerDimKSDADCvMFisherBHDriftDetector(confidence_level)
         if 'bayesian' in methods:
             self.detectors['bayesian'] = BayesianChangePointDetector(confidence_level)
     

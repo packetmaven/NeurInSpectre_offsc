@@ -12,6 +12,7 @@ from __future__ import annotations
 __all__ = [
     "bae",
     "backdoor",
+    "frameworks_compare",
     "gradinversion",
     "prompt_injection",
     "textfooler",

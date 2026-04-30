@@ -365,11 +365,24 @@ class RandomizedSmoothingDefense(DefenseWrapper):
     def forward(self, x: torch.Tensor, use_approximation: bool = False) -> torch.Tensor:
         if self._eot_enabled:
             return self.base_model(self.transform(x))
-        logits_acc = None
-        for _ in range(self.n_samples):
-            logits = self.base_model(self.transform(x))
-            logits_acc = logits if logits_acc is None else logits_acc + logits
-        return logits_acc / float(self.n_samples)
+        # Vectorize the Monte-Carlo estimate to avoid Python loops. This matters
+        # for Table-style runs where `n_samples` is large.
+        n = int(self.n_samples)
+        if n <= 1:
+            return self.base_model(self.transform(x))
+        b = int(x.size(0))
+        # [n, B, C, H, W]
+        noise = torch.randn((n, *x.shape), device=x.device, dtype=x.dtype) * float(self.sigma)
+        x_rep = x.unsqueeze(0).expand(n, *x.shape)
+        x_noisy = torch.clamp(x_rep + noise, 0.0, 1.0).reshape(n * b, *x.shape[1:])
+
+        # Chunk to avoid OOM on laptop GPUs / MPS.
+        max_batch = 512
+        logits_chunks = []
+        for chunk in x_noisy.split(max_batch, dim=0):
+            logits_chunks.append(self.base_model(chunk))
+        logits = torch.cat(logits_chunks, dim=0).reshape(n, b, -1).mean(dim=0)
+        return logits
 
     def get_bpda_approximation(self) -> Callable[[torch.Tensor], torch.Tensor]:
         return self.transform
@@ -543,6 +556,141 @@ class RLObfuscationDefense(DefenseWrapper):
         return logits_acc / float(max(1, self.n_samples))
 
 
+class TentDefense(DefenseWrapper):
+    """
+    Test-Time Entropy Minimization (TENT) wrapper.
+
+    Tier 2 motivation:
+    - Provides a practical, non-synthetic *stateful* defense proxy for validating
+      RL/Volterra detection logic without needing custom RL training pipelines.
+    - Updates BatchNorm affine parameters at inference time by minimizing the
+      entropy of predictions (i.e., adapts to the test distribution).
+
+    Notes:
+    - This wrapper changes model parameters at inference time. That is expected.
+    - This is not "stochastic" in the EOT sense; it is stateful across calls.
+    """
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        *,
+        lr: float = 1e-3,
+        steps: int = 1,
+        reset_each_forward: bool = False,
+        device: str = "cuda",
+    ):
+        spec = DefenseSpec(
+            name="tent",
+            domain="vision",
+            # Treat as "policy-like / stateful" for reporting; characterization
+            # still drives attack routing.
+            obfuscation_types=[ObfuscationType.RL_TRAINED],
+            params={
+                "lr": float(lr),
+                "steps": int(steps),
+                "reset_each_forward": bool(reset_each_forward),
+            },
+            requires_bpda=False,
+            is_stochastic=False,
+        )
+        super().__init__(base_model, spec, device)
+        self.lr = float(lr)
+        self.steps = int(steps)
+        self.reset_each_forward = bool(reset_each_forward)
+
+        self._tent_params: List[nn.Parameter] = []
+        self._optimizer: Optional[torch.optim.Optimizer] = None
+        self._initial_state: Optional[Dict[str, torch.Tensor]] = None
+
+        self._configure_tent()
+        if self.reset_each_forward:
+            # Only cache full state when requested; can be large for big models.
+            self._initial_state = {k: v.detach().cpu().clone() for k, v in self.base_model.state_dict().items()}
+
+    def _configure_tent(self) -> None:
+        # Freeze all params; enable only BN affine parameters.
+        for p in self.base_model.parameters():
+            p.requires_grad_(False)
+
+        params: List[nn.Parameter] = []
+        for m in self.base_model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                if getattr(m, "weight", None) is not None:
+                    m.weight.requires_grad_(True)
+                    params.append(m.weight)
+                if getattr(m, "bias", None) is not None:
+                    m.bias.requires_grad_(True)
+                    params.append(m.bias)
+
+        self._tent_params = params
+        if not self._tent_params:
+            logger.warning("TentDefense: no BatchNorm affine parameters found; no-op defense.")
+            self._optimizer = None
+            return
+
+        self._optimizer = torch.optim.SGD(self._tent_params, lr=float(self.lr), momentum=0.0)
+
+    def reset_state(self) -> None:
+        if self._initial_state is None:
+            return
+        self.base_model.load_state_dict(self._initial_state, strict=False)
+        if self._optimizer is not None:
+            self._optimizer.state = {}
+
+    @staticmethod
+    def _disable_dropout(model: nn.Module) -> None:
+        for m in model.modules():
+            if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
+                m.eval()
+
+    @staticmethod
+    def _entropy_loss(logits: torch.Tensor) -> torch.Tensor:
+        # Binary-logit models: shape [B] or [B,1]
+        if logits.ndim == 1:
+            p = torch.sigmoid(logits)
+            p = p.clamp(min=1e-12, max=1.0 - 1e-12)
+            ent = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
+            return ent.mean()
+        if logits.ndim == 2 and int(logits.size(1)) == 1:
+            p = torch.sigmoid(logits.squeeze(1))
+            p = p.clamp(min=1e-12, max=1.0 - 1e-12)
+            ent = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
+            return ent.mean()
+
+        # Multi-class logits
+        p = F.softmax(logits, dim=1)
+        p = p.clamp_min(1e-12)
+        return (-(p * p.log()).sum(dim=1)).mean()
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        # TENT is a model adaptation defense, not an input-space transform.
+        return x
+
+    def forward(self, x: torch.Tensor, use_approximation: bool = False) -> torch.Tensor:
+        x = x.to(self.device)
+        if self.reset_each_forward:
+            self.reset_state()
+
+        if self.steps <= 0 or self._optimizer is None:
+            return self.base_model(self.transform(x))
+
+        # Adaptation phase: update BN affine parameters using entropy minimization.
+        self.base_model.train()
+        self._disable_dropout(self.base_model)
+        for _ in range(int(self.steps)):
+            logits = self.base_model(self.transform(x))
+            loss = self._entropy_loss(logits)
+            self._optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            self._optimizer.step()
+
+        # Inference phase: return logits from adapted model without tracking grads.
+        self.base_model.eval()
+        with torch.no_grad():
+            return self.base_model(self.transform(x))
+
+
 class EnsembleDiversityDefense(DefenseWrapper):
     def __init__(self, models: List[nn.Module], aggregation: str = "average", device: str = "cuda"):
         spec = DefenseSpec(
@@ -653,24 +801,94 @@ class SpatialSmoothingDefense(DefenseWrapper):
 
 
 class CertifiedDefense(DefenseWrapper):
-    def __init__(self, base_model: nn.Module, sigma: float = 0.5, device: str = "cuda"):
+    def __init__(self, base_model: nn.Module, sigma: float = 0.5, n_samples: int = 100, device: str = "cuda"):
         spec = DefenseSpec(
             name="certified_defense",
             domain="av_perception",
             obfuscation_types=[ObfuscationType.STOCHASTIC],
-            params={"sigma": float(sigma)},
+            params={"sigma": float(sigma), "n_samples": int(n_samples)},
             is_stochastic=True,
             eot_samples=100,
         )
         super().__init__(base_model, spec, device)
         self.sigma = float(sigma)
+        self.n_samples = int(n_samples)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         noise = torch.randn_like(x) * self.sigma
         return torch.clamp(x + noise, 0, 1)
 
+    def forward(self, x: torch.Tensor, use_approximation: bool = False) -> torch.Tensor:
+        # Same rationale as RandomizedSmoothingDefense:
+        # - When EOT is enabled (attacks), we provide a single-sample stochastic forward.
+        # - For evaluation/clean inference, average logits to avoid collapsing accuracy under noise.
+        if self._eot_enabled:
+            return self.base_model(self.transform(x))
+
+        n = int(self.n_samples)
+        if n <= 1:
+            return self.base_model(self.transform(x))
+
+        b = int(x.size(0))
+        noise = torch.randn((n, *x.shape), device=x.device, dtype=x.dtype) * float(self.sigma)
+        x_rep = x.unsqueeze(0).expand(n, *x.shape)
+        x_noisy = torch.clamp(x_rep + noise, 0.0, 1.0).reshape(n * b, *x.shape[1:])
+
+        max_batch = 256
+        logits_chunks = []
+        for chunk in x_noisy.split(max_batch, dim=0):
+            logits_chunks.append(self.base_model(chunk))
+        logits = torch.cat(logits_chunks, dim=0).reshape(n, b, -1).mean(dim=0)
+        return logits
+
     def get_bpda_approximation(self) -> Callable[[torch.Tensor], torch.Tensor]:
         return self.transform
+
+    def certified_radius(self, x: torch.Tensor, n_samples: int = 1000) -> float:
+        """
+        Estimate a randomized-smoothing certified radius for a single sample.
+
+        This is a diagnostic helper (not a full certification pipeline).
+        """
+        try:
+            from scipy.stats import norm as _norm
+        except Exception as exc:
+            raise ImportError("scipy is required for certified radius computation") from exc
+
+        n_samples = int(n_samples)
+        if n_samples <= 0:
+            raise ValueError(f"n_samples must be >= 1, got {n_samples}")
+        if x.ndim == 0 or int(x.shape[0]) != 1:
+            raise ValueError("certified_radius expects a single input (batch_size==1).")
+
+        counts = None
+        with torch.no_grad():
+            for _ in range(n_samples):
+                logits = self.base_model(self.transform(x))
+                preds = logits.argmax(dim=1)
+                if counts is None:
+                    if logits.ndim != 2 or int(logits.size(0)) != 1:
+                        raise ValueError(
+                            "certified_radius expects logits with shape (1, C). "
+                            f"Got shape={tuple(logits.shape)}"
+                        )
+                    counts = torch.zeros(int(logits.size(1)), device=x.device, dtype=torch.float32)
+                counts.scatter_add_(0, preds.to(torch.int64), torch.ones_like(preds, dtype=counts.dtype))
+
+        if counts is None or float(counts.sum().item()) <= 0.0:
+            return 0.0
+
+        p_a = float((counts.max() / counts.sum()).item())
+        if p_a <= 0.5:
+            return 0.0
+
+        # Clamp away from {0,1} to keep ppf finite.
+        eps = 1e-6
+        p_a = max(0.5 + eps, min(p_a, 1.0 - eps))
+        radius = float(self.sigma) * float(_norm.ppf(p_a))
+        if (not math.isfinite(radius)) or radius < 0.0:
+            return 0.0
+        return float(radius)
 
 
 class ATTransformDefense(DefenseWrapper):
@@ -726,6 +944,7 @@ __all__ = [
     "RandomNoiseDefense",
     "EnsembleDiversityDefense",
     "DefensiveDistillationDefense",
+    "TentDefense",
     "GradientRegularizationDefense",
     "SpatialSmoothingDefense",
     "CertifiedDefense",

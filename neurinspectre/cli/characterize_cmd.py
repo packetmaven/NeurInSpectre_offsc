@@ -43,6 +43,7 @@ from .utils import (
     build_defense,
     load_dataset,
     load_model,
+    load_threshold_overrides,
     load_yaml,
     resolve_device,
     save_json,
@@ -168,6 +169,14 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
     epsilon = DEFAULT_EPSILON
     visualize = bool(kwargs.get("visualize", False))
 
+    threshold_overrides: Optional[Dict[str, Any]] = None
+    threshold_overrides_path = kwargs.get("threshold_overrides")
+    if threshold_overrides_path:
+        try:
+            threshold_overrides = load_threshold_overrides(str(threshold_overrides_path))
+        except Exception as exc:
+            raise click.ClickException(f"Failed to load --threshold-overrides: {exc}") from exc
+
     # Paper Section 4: validate Krylov order
     if krylov_order < 10 or krylov_order > 50:
         logger.warning(
@@ -212,6 +221,9 @@ def run_characterization(ctx: click.Context, **kwargs: Any) -> None:
         device=device,
         verbose=verbose,
         krylov_dim=krylov_order,
+        thresholds=threshold_overrides,
+        volterra_gradient_source=str(kwargs.get("volterra_gradient_source", "pre_optimizer")),
+        volterra_optimizer=str(kwargs.get("volterra_optimizer", "sgd")),
     )
 
     start_time = time.time()

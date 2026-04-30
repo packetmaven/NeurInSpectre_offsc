@@ -1,0 +1,27 @@
+{
+  "dataset": "ember",
+  "checkpoint_tag": "md_at_transform_ember",
+  "variant": "at_transform",
+  "input_dim": 2381,
+  "num_classes": 2,
+  "seed": 42,
+  "device": "mps",
+  "train_samples": 100000,
+  "val_samples": 20000,
+  "lr": 0.001,
+  "epochs": 2,
+  "noise_std": 0.05,
+  "epsilon_l2": 0.5,
+  "pgd_steps": 7,
+  "val_acc": 0.60455,
+  "train_stats": {
+    "epochs": 2.0,
+    "last_loss": 0.5218993425369263
+  },
+  "sha256": "d581156ae2ba0dfedab62cf94bcd9940d73181f0afd90ea2994918b982f68234",
+  "torch_version": "2.10.0",
+  "elapsed_seconds": 48.470502853393555,
+  "torchscript_path": "models/md_at_transform_ember_ts.pt",
+  "state_dict_path": "models/checkpoints/md_at_transform_ember.pt",
+  "init_from": "standard_teacher"
+}

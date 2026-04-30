@@ -33,7 +33,8 @@ defaults:
 
   # Iterations and steps for gradient-based attacks
   pgd:
-    steps: 50
+    # Draft Table 8 uses "PGD-20".
+    steps: 20
     step_size: 0.00784313725490196  # 2/255
     random_start: true
   apgd:
@@ -57,6 +58,17 @@ defaults:
     device: "auto"                  # "cuda", "mps", or "cpu"
     dtype: "float32"
 
+# Evaluation sanity gates (do not encode paper baselines).
+#
+# In strict-real-data mode, the CLI enables validity gates by default to prevent
+# meaningless ASR reporting when clean accuracy collapses (random/stub models,
+# broken data pipelines, etc). For Table 8 reproduction we keep the gates enabled
+# but *non-strict* so the full 12x3 matrix can complete while recording per-pair
+# validity metadata in artifacts.
+validity_gates:
+  enabled: true
+  strict: false
+
 # Datasets used in Table 2
 datasets:
   content_moderation:
@@ -64,27 +76,22 @@ datasets:
     backing_dataset: "cifar10"      # CIFAR-10 proxy for content moderation
     split: "test"
     num_classes: 10
-    data_module: "neurinspectre.data.datasets"
-    loader_fn: "get_content_moderation_dataset"
 
   malware_detection:
     name: "malware_detection"
     backing_dataset: "ember"
     split: "test"
     num_classes: 2
-    data_module: "neurinspectre.data.datasets"
-    loader_fn: "get_ember_dataset"
     notes: >
       Requires correctly vectorized EMBER2018 (X_train.dat/X_test.dat with
-      aligned labels); see forthcoming scripts/vectorize_ember_safe.py.
+      aligned labels); from scratch use scripts/download_ember2018.py +
+      scripts/vectorize_ember_safe.py.
 
   av_perception:
     name: "av_perception"
     backing_dataset: "nuscenes"
     split: "val"
     num_classes: 10
-    data_module: "neurinspectre.data.datasets"
-    loader_fn: "get_nuscenes_perception_dataset"
 
 # Attack configurations used in Table 2
 attacks:
@@ -169,7 +176,8 @@ defenses:
       class_name: "RandomizedSmoothingDefense"
       params:
         sigma: 0.25
-        num_samples: 16
+        # Draft Appendix B (Table 13): sigma=0.25, n=100
+        num_samples: 100
     group: "content_moderation"
 
   - id: "cm_ensemble_diversity"
@@ -205,8 +213,9 @@ defenses:
       module: "neurinspectre.defenses.other"
       class_name: "FeatureSqueezingDefense"
       params:
-        bit_depth: 4
-        sparsify_threshold: 0.01
+        # Draft Appendix B (Table 13): 5-bit + 3x3 median (1D median for EMBER features).
+        bit_depth: 5
+        median_filter_size: 3
     group: "malware_detection"
 
   - id: "md_gradient_regularization"
@@ -222,7 +231,8 @@ defenses:
       module: "neurinspectre.defenses.other"
       class_name: "GradientRegularizationDefense"
       params:
-        lambda_reg: 1e-3
+        # Draft Appendix B (Table 13): lambda=0.1 (Jacobian regularization)
+        lambda_reg: 0.1
     group: "malware_detection"
 
   - id: "md_defensive_distillation"
@@ -238,7 +248,8 @@ defenses:
       module: "neurinspectre.defenses.other"
       class_name: "DefensiveDistillationDefense"
       params:
-        temperature: 20.0
+        # Draft Appendix B (Table 13): T=100
+        temperature: 100.0
     group: "malware_detection"
 
   - id: "md_at_transform"
@@ -254,8 +265,10 @@ defenses:
       module: "neurinspectre.defenses.adversarial_training"
       class_name: "AdversarialTrainingWithTransformsDefense"
       params:
-        transform: "feature_masking"
-        epsilon: 0.5
+        # NOTE: The runnable implementation for `at_transform` is `ATTransformDefense`,
+        # which currently models input transforms as stochastic noise injection.
+        # Keep the spec aligned with code so reproduction is faithful.
+        noise_std: 0.05
     group: "malware_detection"
 
   # --------------------------
@@ -274,7 +287,9 @@ defenses:
       module: "neurinspectre.defenses.preprocessing_wrappers"
       class_name: "SpatialSmoothingDefense"
       params:
-        kernel_size: 5
+        # Draft Appendix B (Table 13): 3x3 Gaussian, sigma=1
+        kernel_size: 3
+        sigma: 1.0
     group: "av_perception"
 
   - id: "av_random_pad_crop"
@@ -306,7 +321,8 @@ defenses:
       module: "neurinspectre.defenses.thermometer_encoding"
       class_name: "ThermometerEncodingDefense"
       params:
-        levels: 10
+        # Draft Appendix B (Table 13): 16 levels/channel
+        levels: 16
     group: "av_perception"
 
   - id: "av_certified_defense"
@@ -322,7 +338,7 @@ defenses:
       module: "neurinspectre.defenses.randomized_smoothing"
       class_name: "CertifiedRandomizedSmoothingDefense"
       params:
-        sigma: 0.25
-        certification_radius: 0.5
+        # Draft Section 6.4 / 7.3 discusses sigma=0.5 smoothing.
+        sigma: 0.5
     group: "av_perception"
 

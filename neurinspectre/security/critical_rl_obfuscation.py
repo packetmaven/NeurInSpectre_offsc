@@ -5,9 +5,36 @@ This module implements advanced detection of RL-trained gradient obfuscation
 based on recent research findings from "RL-Obfuscation: Evading Latent-Space Monitors"
 """
 
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 from scipy.fft import fft, fftfreq
 from scipy.signal import find_peaks
+
+
+_DEFAULT_SRL_FEATURE_NAMES: List[str] = [
+    "policy_fingerprint",
+    "semantic_consistency",
+    "conditional_triggers",
+    "periodic_patterns",
+    "evasion_signatures",
+    "reward_optimization",
+    "training_artifacts",
+    "adversarial_patterns",
+]
+
+
+def _sigmoid(x: float) -> float:
+    # Numerically-stable sigmoid for large |x|.
+    xf = float(x)
+    if xf >= 0.0:
+        z = math.exp(-xf)
+        return float(1.0 / (1.0 + z))
+    z = math.exp(xf)
+    return float(z / (1.0 + z))
 
 class CriticalRLObfuscationDetector:
     """
@@ -15,12 +42,141 @@ class CriticalRLObfuscationDetector:
     Addresses the highest priority threat identified in recent research
     """
     
-    def __init__(self, sensitivity_level='high', verbose: bool = False):
+    def __init__(
+        self,
+        sensitivity_level: str = "high",
+        verbose: bool = False,
+        *,
+        srl_weights_path: Optional[str] = None,
+        srl_threshold: Optional[float] = None,
+    ):
         self.sensitivity_level = sensitivity_level
         self.verbose = bool(verbose)
         self.detection_thresholds = self._initialize_thresholds()
         self.rl_signatures = self._initialize_rl_signatures()
         self.policy_fingerprints = {}
+
+        # Optional Eq.(8)-style SRL calibration: logistic regression over the 8
+        # component scores. If no weights are provided, we keep the existing
+        # heuristic weighted-mean overall_threat computation.
+        self._srl_weights_path: Optional[str] = None
+        self._srl_feature_names: List[str] = list(_DEFAULT_SRL_FEATURE_NAMES)
+        self._srl_coef: Optional[List[float]] = None
+        self._srl_intercept: float = 0.0
+        self._srl_scaler_mean: Optional[List[float]] = None
+        self._srl_scaler_scale: Optional[List[float]] = None
+        self._srl_threshold: float = float(srl_threshold) if srl_threshold is not None else 0.6
+        if srl_weights_path:
+            self.load_srl_weights(srl_weights_path, threshold_override=srl_threshold)
+
+    def load_srl_weights(self, path: str, *, threshold_override: Optional[float] = None) -> None:
+        """
+        Load SRL logistic-regression calibration weights from JSON.
+
+        Supported formats:
+          1) Direct LR params:
+             {"feature_names": [...], "coef": [...], "intercept": <float>, "threshold": 0.6,
+              "scaler": {"mean": [...], "scale": [...]}}
+          2) Named-weight map:
+             {"weights": {"policy_fingerprint": 0.1, ...}, "bias": <float>, "threshold": 0.6}
+          3) Nested under "model" (e.g. script reports):
+             {"feature_names": [...], "model": {"coef": [...], "intercept": <float>, "trained_threshold": 0.6}, ...}
+        """
+        p = Path(str(path)).expanduser()
+        obj: Dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+
+        # Threshold.
+        thr = None
+        for k in ("threshold", "trained_threshold", "srl_threshold"):
+            if k in obj:
+                thr = obj.get(k)
+                break
+        if thr is None and isinstance(obj.get("model"), dict):
+            thr = (obj.get("model") or {}).get("trained_threshold")
+
+        # Feature names.
+        feat = obj.get("feature_names") or obj.get("features") or (obj.get("model") or {}).get("feature_names")
+        feature_names = list(feat) if isinstance(feat, (list, tuple)) and feat else list(_DEFAULT_SRL_FEATURE_NAMES)
+
+        # Coefficients + intercept.
+        coef = obj.get("coef")
+        intercept = obj.get("intercept")
+        if coef is None and isinstance(obj.get("model"), dict):
+            coef = (obj.get("model") or {}).get("coef")
+            intercept = (obj.get("model") or {}).get("intercept")
+        if coef is None and isinstance(obj.get("weights"), dict):
+            wmap = obj.get("weights") or {}
+            coef = [float(wmap.get(str(n), 0.0) or 0.0) for n in feature_names]
+            intercept = obj.get("bias", 0.0)
+
+        if coef is None or intercept is None:
+            raise ValueError("SRL weights JSON missing coef/intercept (or weights/bias).")
+
+        coef_list = [float(x) for x in list(coef)]
+        if len(coef_list) != len(feature_names):
+            raise ValueError(
+                f"SRL coef length {len(coef_list)} does not match feature_names length {len(feature_names)}."
+            )
+        intercept_f = float(intercept)
+
+        # Optional scaler (used by scripts that fit LR on standardized features).
+        scaler = obj.get("scaler") if isinstance(obj.get("scaler"), dict) else None
+        if scaler is None and isinstance(obj.get("model"), dict):
+            scaler = (obj.get("model") or {}).get("scaler") if isinstance((obj.get("model") or {}).get("scaler"), dict) else None
+        mean = None
+        scale = None
+        if isinstance(scaler, dict):
+            mean = scaler.get("mean")
+            scale = scaler.get("scale")
+        mean_list = [float(x) for x in list(mean)] if isinstance(mean, (list, tuple)) else None
+        scale_list = [float(x) for x in list(scale)] if isinstance(scale, (list, tuple)) else None
+        if mean_list is not None and len(mean_list) != len(feature_names):
+            raise ValueError(
+                f"SRL scaler.mean length {len(mean_list)} does not match feature_names length {len(feature_names)}."
+            )
+        if scale_list is not None and len(scale_list) != len(feature_names):
+            raise ValueError(
+                f"SRL scaler.scale length {len(scale_list)} does not match feature_names length {len(feature_names)}."
+            )
+
+        self._srl_weights_path = str(p)
+        self._srl_feature_names = list(feature_names)
+        self._srl_coef = list(coef_list)
+        self._srl_intercept = float(intercept_f)
+        self._srl_scaler_mean = mean_list
+        self._srl_scaler_scale = scale_list
+
+        if threshold_override is not None:
+            self._srl_threshold = float(threshold_override)
+        elif thr is not None:
+            self._srl_threshold = float(thr)
+
+    def _compute_srl_from_components(self, component_scores: Dict[str, float]) -> Dict[str, Any]:
+        if self._srl_coef is None:
+            raise RuntimeError("SRL weights are not loaded")
+
+        x = [float(component_scores.get(n, 0.0) or 0.0) for n in self._srl_feature_names]
+        scaler_applied = False
+        if self._srl_scaler_mean is not None and self._srl_scaler_scale is not None:
+            scaler_applied = True
+            x = [
+                float((xi - mi) / (si if abs(si) > 1e-12 else 1.0))
+                for xi, mi, si in zip(x, self._srl_scaler_mean, self._srl_scaler_scale)
+            ]
+
+        z = float(self._srl_intercept + sum(w * xi for w, xi in zip(self._srl_coef, x)))
+        score = _sigmoid(z)
+        thr = float(self._srl_threshold)
+        return {
+            "method": "logistic_regression",
+            "weights_path": self._srl_weights_path,
+            "feature_names": list(self._srl_feature_names),
+            "scaler_applied": bool(scaler_applied),
+            "logit": float(z),
+            "score": float(score),
+            "threshold": float(thr),
+            "passed": bool(score >= thr),
+        }
         
     def _initialize_thresholds(self):
         """Initialize detection thresholds based on sensitivity level"""
@@ -126,12 +282,42 @@ class CriticalRLObfuscationDetector:
         high_scores = [semantic_score, trigger_score, reward_score]
         medium_scores = [periodic_score, training_score]
         
-        # Weighted threat calculation (critical components have higher weight)
-        overall_threat = (
+        # Weighted threat calculation (critical components have higher weight).
+        # This is the legacy scalar used prior to SRL calibration support.
+        overall_threat_heuristic = (
             np.mean(critical_scores) * 0.5 +
             np.mean(high_scores) * 0.3 +
             np.mean(medium_scores) * 0.2
         )
+
+        overall_threat = float(overall_threat_heuristic)
+
+        # Optional: Eq.(8)-style SRL (logistic regression over 8 component scores).
+        # If weights are loaded, we use SRL as the overall threat scalar while still
+        # exporting the heuristic baseline for auditability.
+        if self._srl_coef is not None:
+            try:
+                srl = self._compute_srl_from_components(component_scores)
+                srl["overall_threat_level_heuristic"] = float(overall_threat_heuristic)
+                srl["used_as_overall_threat_level"] = True
+                overall_threat = float(srl.get("score", overall_threat))
+            except Exception as exc:
+                srl = {
+                    "method": "logistic_regression",
+                    "weights_path": self._srl_weights_path,
+                    "error": str(exc),
+                    "overall_threat_level_heuristic": float(overall_threat_heuristic),
+                    "used_as_overall_threat_level": False,
+                }
+        else:
+            thr = float(self.detection_thresholds.get("overall_threat", 0.6) or 0.6)
+            srl = {
+                "method": "heuristic_weighted_mean",
+                "score": float(overall_threat_heuristic),
+                "threshold": float(thr),
+                "passed": bool(float(overall_threat_heuristic) >= float(thr)),
+                "used_as_overall_threat_level": True,
+            }
         
         # Threat classification
         threat_level = self._classify_threat_level(overall_threat, component_scores)
@@ -141,6 +327,8 @@ class CriticalRLObfuscationDetector:
         
         results = {
             'overall_threat_level': overall_threat,
+            'overall_threat_level_heuristic': float(overall_threat_heuristic),
+            'srl': srl,
             'threat_classification': threat_level,
             'component_scores': component_scores,
             'actionable_intelligence': actionable_intel,

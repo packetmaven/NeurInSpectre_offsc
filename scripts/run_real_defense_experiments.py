@@ -23,10 +23,8 @@ import json
 import os
 import sys
 import time
-from collections import OrderedDict
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -47,185 +45,72 @@ def _resolve_device(requested: str) -> str:
     return "cpu"
 
 
-class WideResNetBlock(nn.Module):
-    """Pre-activation WRN block matching the RobustBench / Carmon2019 layout.
+def load_carmon2019(
+    checkpoint_path: str,
+    device: str,
+    *,
+    cross_verify_with_robustbench: bool = False,
+) -> nn.Module:
+    """Load Carmon2019Unlabeled WRN-28-10 with zero runtime external deps.
 
-    Previously this block had a broken shortcut: ``if self.shortcut:`` always
-    evaluated True (``nn.Sequential()`` is truthy even when empty), so
-    identity-shortcut blocks ran ``empty_seq(out) = out`` and the output
-    became ``conv(...) + out`` instead of ``conv(...) + x``. That silent
-    architectural divergence cost ~10 percentage points of clean accuracy
-    (observed: 80.0% vs published 89.7%).
-    """
+    Uses the vendored, attributed :class:`WideResNetCarmon` module at
+    ``neurinspectre/models/wide_resnet_carmon.py`` (MIT-licensed copy of
+    the RobustBench architecture, with the unused ``sub_block1`` branch
+    preserved so that ``load_state_dict(strict=True)`` succeeds on the
+    canonical checkpoint). This removes the runtime dependency on
+    ``robustbench`` + ``gdown`` + Google-Drive downloads that would
+    otherwise be a long-term reproducibility risk for artifact
+    evaluation.
 
-    def __init__(self, in_planes, out_planes, stride, drop_rate=0.0):
-        super().__init__()
-        self.equal_in_out = (stride == 1 and in_planes == out_planes)
-        self.bn1 = nn.BatchNorm2d(in_planes)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv1 = nn.Conv2d(in_planes, out_planes, 3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_planes)
-        self.relu2 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_planes, out_planes, 3, stride=1, padding=1, bias=False)
-        self.drop_rate = drop_rate
-        if self.equal_in_out:
-            self.shortcut = nn.Identity()
-        else:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, out_planes, 1, stride=stride, bias=False)
-            )
+    A post-load clean-accuracy probe (>=88% on 256 CIFAR-10 test images)
+    catches silent regressions. For extra safety, pass
+    ``cross_verify_with_robustbench=True`` to additionally cross-check
+    against the canonical RobustBench loader (requires
+    ``pip install robustbench``; asserts max|logit-diff| < 1e-4 on a
+    seeded random probe).
 
-    def forward(self, x):
-        out = self.relu1(self.bn1(x))
-        # Pre-activation WRN: identity shortcut uses x (not out);
-        # non-identity shortcut projects the preactivation.
-        shortcut = x if self.equal_in_out else self.shortcut(out)
-        out = self.conv1(out)
-        out = self.relu2(self.bn2(out))
-        if self.drop_rate > 0:
-            out = nn.functional.dropout(out, p=self.drop_rate, training=self.training)
-        out = self.conv2(out)
-        return out + shortcut
-
-
-class WideResNet(nn.Module):
-    def __init__(self, depth=28, widen_factor=10, num_classes=10, drop_rate=0.0):
-        super().__init__()
-        n_channels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
-        assert (depth - 4) % 6 == 0
-        n_blocks = (depth - 4) // 6
-
-        self.conv1 = nn.Conv2d(3, n_channels[0], 3, stride=1, padding=1, bias=False)
-
-        self.block1 = self._make_layer(n_channels[0], n_channels[1], n_blocks, 1, drop_rate)
-        self.block2 = self._make_layer(n_channels[1], n_channels[2], n_blocks, 2, drop_rate)
-        self.block3 = self._make_layer(n_channels[2], n_channels[3], n_blocks, 2, drop_rate)
-
-        self.bn1 = nn.BatchNorm2d(n_channels[3])
-        self.relu = nn.ReLU(inplace=True)
-        self.fc = nn.Linear(n_channels[3], num_classes)
-
-    def _make_layer(self, in_planes, out_planes, n_blocks, stride, drop_rate):
-        layers = []
-        for i in range(n_blocks):
-            s = stride if i == 0 else 1
-            inp = in_planes if i == 0 else out_planes
-            layers.append(WideResNetBlock(inp, out_planes, s, drop_rate))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.block1(out)
-        out = self.block2(out)
-        out = self.block3(out)
-        out = self.relu(self.bn1(out))
-        out = nn.functional.adaptive_avg_pool2d(out, 1)
-        out = out.view(out.size(0), -1)
-        return self.fc(out)
-
-
-def load_carmon2019(checkpoint_path: str, device: str) -> nn.Module:
-    """Load Carmon2019Unlabeled WRN-28-10 via the canonical RobustBench loader.
-
-    Rationale (April 2026 audit): the previous implementation loaded the
-    RobustBench checkpoint into a locally-defined ``WideResNet`` class with
-    ``load_state_dict(..., strict=False)``. This silently dropped 200+/204
-    keys because the checkpoint uses a different nesting convention
-    (``module.block{i}.layer.{j}.*``, ``convShortcut.weight``) than the local
-    class (``block{i}.{j}.*``, ``shortcut.0.weight``), returning a
-    randomly-initialised model with ~10% clean accuracy. Even after key
-    remapping, the local ``WideResNet`` produced only ~81% clean accuracy
-    due to a subtle architectural mismatch we could not isolate. The
-    canonical ``robustbench.utils.load_model`` path achieves the published
-    89.85% and is the only accuracy-safe option.
-
-    We therefore require ``robustbench`` as a hard dependency for this
-    script. A post-load clean-accuracy assertion guards against any future
-    regression.
+    Audit history (April 2026)
+    --------------------------
+    A previous version of this loader used a locally-defined
+    ``WideResNet`` with ``strict=False`` and silently returned a
+    randomly-initialised network (~10% clean accuracy), because the
+    local class's state-dict keys did not match the canonical
+    ``block{i}.layer.{j}.*`` / ``convShortcut`` / ``sub_block1.*``
+    layout. Every gradient / spectral / Volterra / Krylov number
+    produced by the detection paper's real-defense Table 5 was
+    therefore measured on random weights. The vendored
+    :class:`WideResNetCarmon` preserves the canonical layout so that
+    ``strict=True`` loading succeeds natively.
 
     Parameters
     ----------
-    checkpoint_path : str
-        Directory or file path to the checkpoint. RobustBench downloads
-        automatically if missing.
-    device : str
+    checkpoint_path
+        Path to ``Carmon2019Unlabeled.pt`` (obtained via
+        ``scripts/download_carmon2019.py``).
+    device
         Target device.
+    cross_verify_with_robustbench
+        If True and ``robustbench`` is installed, cross-verify logits
+        against RobustBench's canonical loader on a seeded probe.
 
     Returns
     -------
-    nn.Module : Evaluation-mode WRN-28-10 achieving >=88% clean accuracy on
-        a 256-image CIFAR-10 test subset. Raises RuntimeError otherwise.
+    nn.Module
+        Evaluation-mode WRN-28-10 achieving 89.69% +/- (subset-variation)
+        clean accuracy on CIFAR-10.
     """
-    try:
-        from robustbench.utils import load_model as rb_load_model
-    except ImportError as exc:
-        raise ImportError(
-            "robustbench is required for Carmon2019 loading. Install with: "
-            "pip install robustbench. (Previously the script fell back to a "
-            "custom WideResNet class with strict=False, which silently "
-            "returned random weights and produced invalid results.)"
-        ) from exc
-
-    # RobustBench manages its own directory layout; it stores the checkpoint
-    # under <model_dir>/cifar10/Linf/Carmon2019Unlabeled.pt. We accept either
-    # a file or directory path for backward compat.
-    ckpt_path = Path(checkpoint_path)
-    if ckpt_path.is_file():
-        # Honour existing layout: use the parent's parent as model_dir so
-        # RobustBench treats the already-downloaded file as canonical.
-        model_dir = ckpt_path.parent.parent.parent if ckpt_path.parent.name == "Linf" else ckpt_path.parent
-    else:
-        model_dir = ckpt_path
-
-    model = rb_load_model(
-        model_name="Carmon2019Unlabeled",
-        dataset="cifar10",
-        threat_model="Linf",
-        model_dir=str(model_dir),
+    from neurinspectre.models.wide_resnet_carmon import (
+        load_carmon2019_local,
     )
-    model = model.to(device).eval()
 
-    # Post-load clean-accuracy assertion. This is the only way to catch
-    # silent regressions in the RobustBench loader or architecture.
-    _assert_clean_accuracy(model, device, min_acc=0.88, n=256)
-    return model
-
-
-def _assert_clean_accuracy(model: nn.Module, device: str, min_acc: float = 0.88,
-                            n: int = 256) -> None:
-    """Probe clean accuracy on a small CIFAR-10 subset; raise if below min_acc.
-
-    This is the last line of defence against silent random-model bugs. Any
-    published-accuracy model must clear min_acc on this probe.
-    """
-    try:
-        from neurinspectre.evaluation.datasets import CIFAR10Dataset
-    except ImportError:
-        return  # can't probe, skip
-    try:
-        loader, _, _ = CIFAR10Dataset.load(
-            root="./data/cifar10", n_samples=n, seed=42, batch_size=64,
-            split="test", download=False, num_workers=0, pin_memory=False,
-        )
-    except Exception:
-        return  # data missing; skip probe (caller's responsibility)
-    ok = tot = 0
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            ok += int((model(xb).argmax(1) == yb).sum().item())
-            tot += int(xb.size(0))
-    acc = ok / max(tot, 1)
-    if acc < min_acc:
-        raise RuntimeError(
-            f"Clean-accuracy sanity check failed: {100 * acc:.2f}% on {tot} "
-            f"CIFAR-10 test images (required >= {100 * min_acc:.2f}%). "
-            f"This typically means state_dict keys did not populate the "
-            f"model. Re-run with --device cpu to rule out MPS precision; "
-            f"if the failure persists, the loader is returning a "
-            f"randomly-initialised network and any downstream numbers are "
-            f"invalid."
-        )
+    return load_carmon2019_local(
+        str(checkpoint_path),
+        device=device,
+        assert_clean_accuracy=True,
+        min_clean_accuracy=0.88,
+        sanity_n_samples=256,
+        cross_verify_with_robustbench=cross_verify_with_robustbench,
+    )
 
 
 EXPERIMENTS = [
@@ -364,16 +249,16 @@ def main():
         results.append(result)
 
         if "error" not in result:
-            print(f"\n  --- Layer 1 (Spectral) ---")
+            print("\n  --- Layer 1 (Spectral) ---")
             print(f"    H_S (norm):  {result['layer1_spectral_entropy_norm']:.4f}")
             print(f"    R_HF:        {result['layer1_high_freq_ratio']:.4f}")
-            print(f"  --- Layer 2 (Volterra) ---")
+            print("  --- Layer 2 (Volterra) ---")
             print(f"    alpha:       {result['layer2_alpha_volterra']:.4f}")
             print(f"    RMSE:        {result['layer2_volterra_rmse']:.6f}")
-            print(f"  --- Layer 3 (Krylov) ---")
+            print("  --- Layer 3 (Krylov) ---")
             print(f"    recon error: {result['layer3_krylov_rel_error_mean']:.6f}")
             print(f"    norm ratio:  {result['layer3_krylov_norm_ratio_mean']:.4f}")
-            print(f"  --- Verdict ---")
+            print("  --- Verdict ---")
             print(f"    Detected:    {result['paper_composite_detected']}")
             print(f"    Triggers:    {result['paper_triggers']}")
             print(f"    Obf types:   {result['detected_obfuscation']}")

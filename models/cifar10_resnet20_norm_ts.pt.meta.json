@@ -2,6 +2,9 @@
   "dataset": "cifar10",
   "architecture": "resnet20",
   "format": "torchscript",
+  "num_classes": 10,
+  "sha256": "7b516d5013854ae954bb39e7319d4b9a7a071038b85f706eb274cba1c9ac3bce",
+  "torchscript_path": "models/cifar10_resnet20_norm_ts.pt",
   "notes": "Small trained CIFAR-10 model intended for strict real-data smoke runs."
 }
 

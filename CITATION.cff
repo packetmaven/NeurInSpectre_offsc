@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated paper(s)."
+title: "NeurInSpectre: A Three-Layer Mathematical Framework for Gradient Obfuscation Detection in Adversarial Machine Learning"
+type: software
+license: MIT
+version: "2.0.0"
+date-released: "2026-01-01"
+authors:
+  - name: "NeurInSpectre Contributors"
+keywords:
+  - gradient obfuscation
+  - adversarial machine learning
+  - spectral analysis
+  - Volterra equations
+  - Krylov subspace methods
+  - defense evaluation
+  - neural network security
+repository-code: "https://artifact.invalid"
+preferred-citation:
+  type: conference-paper
+  title: "NeurInSpectre: A Three-Layer Mathematical Framework for Gradient Obfuscation Detection in Adversarial Machine Learning"
+  authors:
+    - name: "Anonymous Author(s)"
+  year: 2026
+  collection-title: "Proceedings of ACM Conference on Computer and Communications Security (CCS '26)"
+  publisher:
+    name: "ACM"
+  conference:
+    name: "CCS '26"
+    city: "Salt Lake City"
+    region: "UT"
+    country: "US"

@@ -1,0 +1,23 @@
+{
+  "dataset": "ember",
+  "checkpoint_tag": null,
+  "variant": "standard",
+  "input_dim": 2381,
+  "num_classes": 2,
+  "seed": 42,
+  "device": "mps",
+  "train_samples": 100000,
+  "val_samples": 20000,
+  "lr": 0.001,
+  "epochs": 5,
+  "val_acc": 0.6314,
+  "train_stats": {
+    "epochs": 5.0,
+    "last_loss": 0.5485507249832153
+  },
+  "sha256": "935dd150963952db2dc088c201056d555f251be8cd541b221aa2a91dd0362624",
+  "torch_version": "2.10.0",
+  "elapsed_seconds": 19.18437886238098,
+  "torchscript_path": "models/ember_mlp_ts.pt",
+  "state_dict_path": "models/checkpoints/ember_mlp.pt"
+}

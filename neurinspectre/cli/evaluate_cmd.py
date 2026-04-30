@@ -41,6 +41,7 @@ from .utils import (
     evaluate_attack_runner,
     load_dataset,
     load_model,
+    load_threshold_overrides,
     load_yaml,
     resolve_device,
     save_json,
@@ -118,12 +119,84 @@ def _mean_std(values: List[Any]) -> Tuple[float, float, int]:
     return mean, float(math.sqrt(max(0.0, var))), n
 
 
+def _t_critical_975(df: int) -> float:
+    """
+    Two-sided 95% CI uses t_{0.975, df}.
+
+    We intentionally avoid a SciPy dependency here. This lookup is sufficient for
+    the repo's intended usage (n_seeds typically 5-10 for paper tables).
+    """
+    try:
+        dfi = int(df)
+    except Exception:
+        dfi = 0
+    if dfi <= 0:
+        return float("nan")
+    # Source: standard t critical value table for p=0.975 (two-sided 95% CI).
+    table = {
+        1: 12.706,
+        2: 4.303,
+        3: 3.182,
+        4: 2.776,
+        5: 2.571,
+        6: 2.447,
+        7: 2.365,
+        8: 2.306,
+        9: 2.262,
+        10: 2.228,
+        11: 2.201,
+        12: 2.179,
+        13: 2.160,
+        14: 2.145,
+        15: 2.131,
+        16: 2.120,
+        17: 2.110,
+        18: 2.101,
+        19: 2.093,
+        20: 2.086,
+        21: 2.080,
+        22: 2.074,
+        23: 2.069,
+        24: 2.064,
+        25: 2.060,
+        26: 2.056,
+        27: 2.052,
+        28: 2.048,
+        29: 2.045,
+        30: 2.042,
+    }
+    if dfi in table:
+        return float(table[dfi])
+    # Large-df approximation: standard normal.
+    return 1.96
+
+
+def _mean_std_ci95(values: List[Any], *, clamp01: bool = False) -> Tuple[float, float, int, float, float]:
+    """
+    Return mean, std (sample), n, and 95% CI for the mean.
+    """
+    mean, std, n = _mean_std(values)
+    if n <= 1:
+        lo = float(mean)
+        hi = float(mean)
+    else:
+        se = float(std) / float(math.sqrt(float(n)))
+        tcrit = _t_critical_975(n - 1)
+        half = float(tcrit) * float(se)
+        lo = float(mean) - half
+        hi = float(mean) + half
+    if clamp01:
+        lo = max(0.0, min(1.0, lo))
+        hi = max(0.0, min(1.0, hi))
+    return float(mean), float(std), int(n), float(lo), float(hi)
+
+
 def _aggregate_pair_metrics(per_seed: List[Dict[str, Any]], *, seeds: List[int]) -> Dict[str, Any]:
     """
     Aggregate a single (defense, attack) metrics dict across seeds.
 
     We keep the mean in the original key (for compatibility with compare/ranking),
-    and add *_std and *_n keys alongside it.
+    and add *_std / *_n / *_ci95_low / *_ci95_high keys alongside it.
     """
     out: Dict[str, Any] = {}
     for key in ("attack_success_rate", "robust_accuracy", "clean_accuracy", "correct_samples", "samples"):
@@ -133,17 +206,21 @@ def _aggregate_pair_metrics(per_seed: List[Dict[str, Any]], *, seeds: List[int])
                 continue
             if key in m:
                 vals.append(m.get(key))
-        mean, std, n = _mean_std(vals)
+        clamp01 = key in {"attack_success_rate", "robust_accuracy", "clean_accuracy"}
+        mean, std, n, lo, hi = _mean_std_ci95(vals, clamp01=clamp01)
         out[key] = float(mean)
         out[f"{key}_std"] = float(std)
         out[f"{key}_n"] = int(n)
+        out[f"{key}_ci95_low"] = float(lo)
+        out[f"{key}_ci95_high"] = float(hi)
 
     # For auditability: include the ASR per seed.
     seed_asr: Dict[str, float] = {}
     for seed, m in zip(seeds, per_seed):
         if isinstance(m, dict) and "attack_success_rate" in m:
             try:
-                seed_asr[str(seed)] = float(m.get("attack_success_rate", 0.0))
+                # Keep audit output stable/readable (avoid 0.30000000000000004 noise).
+                seed_asr[str(seed)] = float(round(float(m.get("attack_success_rate", 0.0)), 12))
             except Exception:
                 seed_asr[str(seed)] = 0.0
     out["attack_success_rate_by_seed"] = seed_asr
@@ -227,6 +304,39 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
     config_base_dir = Path(str(config_path)).resolve().parent
     config = load_yaml(config_path)
 
+    # -------------------------------------------------------------------
+    # Tier 2: optional calibrated threshold injection for Phase 1
+    # -------------------------------------------------------------------
+    # Config accepts:
+    #   characterization_thresholds: path/to/thresholds.json
+    # or
+    #   threshold_overrides: path/to/thresholds.json
+    # or
+    #   characterization_thresholds: { ... overrides dict ... }
+    thr_cfg = (
+        config.get("characterization_thresholds")
+        or config.get("threshold_overrides")
+        or config.get("thresholds")
+    )
+    if isinstance(thr_cfg, (str, Path)):
+        p = Path(str(thr_cfg))
+        if not p.is_absolute():
+            cwd_candidate = Path.cwd() / p
+            if cwd_candidate.exists():
+                p = cwd_candidate
+            else:
+                p = config_base_dir / p
+        if not p.exists():
+            raise click.ClickException(f"characterization_thresholds file not found: {p}")
+        try:
+            config["characterization_thresholds"] = load_threshold_overrides(p)
+            config["characterization_thresholds_path"] = str(p)
+        except Exception as exc:
+            raise click.ClickException(f"Failed to load characterization_thresholds: {exc}") from exc
+    elif isinstance(thr_cfg, dict):
+        # Ensure the key is present at the expected location (AttackFactory reads it).
+        config["characterization_thresholds"] = dict(thr_cfg)
+
     quiet = bool(ctx.obj.get("quiet", False)) if ctx and ctx.obj else False
     no_progress = bool(kwargs.get("no_progress", False))
     report_format = str(kwargs.get("report_format", "rich"))
@@ -238,15 +348,16 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     smoke_test = bool(kwargs.get("smoke_test", False))
     # Best-effort artifact metadata capture for AE/debugging.
-    try:
-        write_run_metadata(
-            out_dir,
-            config_path=config_path,
-            device=str(device),
-            extra={"command": "evaluate", "smoke_test": smoke_test},
-        )
-    except Exception:
-        logger.debug("Failed to write run metadata", exc_info=True)
+    if not bool(kwargs.get("_skip_run_metadata", False)):
+        try:
+            write_run_metadata(
+                out_dir,
+                config_path=config_path,
+                device=str(device),
+                extra={"command": "evaluate", "smoke_test": smoke_test},
+            )
+        except Exception:
+            logger.debug("Failed to write run metadata", exc_info=True)
 
     defense_filter = set(kwargs.get("defenses") or [])
     attack_filter = set(kwargs.get("attacks") or [])
@@ -255,7 +366,7 @@ def run_evaluation(ctx: click.Context, **kwargs: Any) -> None:
     summary_only = bool(kwargs.get("summary_only", False))
 
     # -------------------------------------------------------------------
-    # Issue 8: multi-seed replication (mean ± std)
+    # Issue 8 (+ WOOT revision): multi-seed replication (mean ± std + 95% CI)
     # -------------------------------------------------------------------
     seed_override = kwargs.get("_seed_override", None)
     if seed_override is not None:
@@ -798,8 +909,24 @@ def _evaluate_defense(
     defense_type = defense_entry.get("type", defense_name)
 
     output_path = out_dir / f"{defense_name}.json"
+    existing: Dict[str, Any] | None = None
+    existing_attacks: Dict[str, Any] = {}
+    existing_characterization: Dict[str, Any] = {}
+    existing_integrity: Dict[str, Any] = {}
     if resume and output_path.exists():
-        return _load_json(output_path)
+        # Resume semantics: merge per-attack results.
+        #
+        # Previous behavior returned early and prevented "resume then run missing attacks"
+        # workflows (common when AutoAttack is slow or a dataset fails mid-matrix).
+        try:
+            loaded = _load_json(output_path)
+            if isinstance(loaded, dict):
+                existing = loaded
+                existing_attacks = dict(loaded.get("attacks", {}) or {})
+                existing_characterization = dict(loaded.get("characterization", {}) or {})
+                existing_integrity = dict(loaded.get("integrity", {}) or {})
+        except Exception:
+            existing = None
 
     datasets_cfg = config.get("datasets", {})
     dataset_name = _resolve_dataset(defense_entry, datasets_cfg)
@@ -828,7 +955,7 @@ def _evaluate_defense(
 
     loader, _x, _y = load_dataset(
         dataset_name,
-        data_path=dataset_cfg.get("data_path"),
+        data_path=dataset_cfg.get("data_path") or dataset_cfg.get("path") or dataset_cfg.get("root"),
         labels_path=labels_path,
         nuscenes_version=nuscenes_version,
         num_samples=num_samples,
@@ -836,6 +963,7 @@ def _evaluate_defense(
         seed=seed,
         num_workers=num_workers,
         split=split,
+        download=bool(dataset_cfg.get("download", True)),
         device=device,
     )
 
@@ -929,17 +1057,28 @@ def _evaluate_defense(
     defense_model = build_defense(defense_type, model, defense_params, device=device)
     eval_model = defense_model or model
 
-    attack_results: Dict[str, Any] = {}
-    characterization: Dict[str, Any] = {}
+    attack_results: Dict[str, Any] = dict(existing_attacks)
+    characterization: Dict[str, Any] = dict(existing_characterization)
 
     for attack_entry in attacks:
-        attack_name = attack_entry.get("name")
+        # Support multiple variants of the same underlying attack by allowing:
+        #   {"name": "neurinspectre_no_mem", "type": "neurinspectre", ...}
+        #
+        # Back-compat: if `type` is absent, `name` is treated as the implementation key.
+        attack_name = attack_entry.get("name") or attack_entry.get("id") or attack_entry.get("type")
+        attack_type = attack_entry.get("type") or attack_name
+        if not attack_name or not attack_type:
+            continue
+        # If we are resuming and already have this attack in the per-defense JSON,
+        # do not recompute it.
+        if resume and attack_name in existing_attacks:
+            continue
         attack_cfg = dict(base_attack_cfg)
         attack_cfg.update(
             {
                 k: v
                 for k, v in attack_entry.items()
-                if k not in {"name", "type"}
+                if k not in {"name", "id", "type"}
             }
         )
         # Allow per-attack ``steps`` to override the global ``iterations`` default.
@@ -956,7 +1095,7 @@ def _evaluate_defense(
             dataset_name=dataset_name,
             strict_budget=bool(config.get("strict_dataset_budgets", False)),
         )
-        attack_key = str(attack_name).lower()
+        attack_key = str(attack_type).lower()
         # For baseline attacks (PGD/APGD/AutoAttack/...), the attack target is the
         # *defended* model. For BPDA/EOT/Hybrid/NeurInSpectre, we need both the
         # base model and the defense wrapper so the attack can use transform()
@@ -967,6 +1106,13 @@ def _evaluate_defense(
         else:
             attack_model = eval_model
             attack_defense = None
+
+        # Tier 2: allow Table2 runs to apply calibrated thresholds to the Phase 1
+        # DefenseAnalyzer characterization inside the NeurInSpectre runner.
+        if attack_key == "neurinspectre":
+            thresholds = config.get("characterization_thresholds")
+            if isinstance(thresholds, dict) and thresholds:
+                attack_cfg.setdefault("characterization_thresholds", dict(thresholds))
 
         runner = AttackFactory.create_attack(
             attack_key,
@@ -998,7 +1144,7 @@ def _evaluate_defense(
                     f"{int(validity.get('observed', {}).get('samples', 0))} "
                     f"reasons={','.join(validity.get('reasons', []) or [])}"
                 )
-        attack_results[attack_name] = summary
+        attack_results[str(attack_name)] = summary
 
         if progress_callback:
             asr = float(summary.get("attack_success_rate", 0.0))
@@ -1008,7 +1154,9 @@ def _evaluate_defense(
                 description=f"{defense_name} vs {attack_name} ASR={asr:.1%} RA={robust:.1%}",
             )
 
-        if attack_name == "neurinspectre" and hasattr(runner, "characterization"):
+        # Record characterization once per defense (the output should be identical across
+        # multiple neurinspectre variants; the `type` may differ only by routing toggles).
+        if attack_key == "neurinspectre" and hasattr(runner, "characterization"):
             try:
                 characterization = runner.characterization.to_dict()
             except Exception:
@@ -1021,8 +1169,14 @@ def _evaluate_defense(
         "attacks": attack_results,
         "characterization": characterization,
     }
+    # Preserve integrity info if present from either the current run or prior resume file.
+    integrity_out: Dict[str, Any] = {}
+    if existing_integrity:
+        integrity_out.update(existing_integrity)
     if integrity:
-        result["integrity"] = integrity
+        integrity_out.update(integrity)
+    if integrity_out:
+        result["integrity"] = integrity_out
     save_json(result, output_path)
     return result
 

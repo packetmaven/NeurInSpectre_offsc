@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from ..mathematical.krylov import analyze_krylov_projection
 from ..mathematical.volterra import compute_volterra_correlation, fit_volterra_kernel
+from .layer1_spectral import compute_spectral_features
 
 
 class ObfuscationType(Enum):
@@ -97,6 +98,12 @@ class DefenseAnalyzer:
         device: str = "cuda",
         verbose: bool = True,
         krylov_dim: int = 20,
+        thresholds: Dict[str, Any] | None = None,
+        volterra_gradient_source: str = "pre_optimizer",
+        volterra_optimizer: str = "sgd",
+        volterra_optimizer_beta1: float = 0.9,
+        volterra_optimizer_beta2: float = 0.999,
+        volterra_optimizer_eps: float = 1e-8,
     ):
         self.model = model.to(device)
         self.n_samples = int(n_samples)
@@ -105,9 +112,24 @@ class DefenseAnalyzer:
         self.verbose = verbose
         self.krylov_dim = int(krylov_dim)
 
+        # Tier 2: optimizer-confound control for Volterra alpha.
+        #
+        # Default behavior (pre_optimizer) matches the paper intent: fit alpha on the
+        # raw ∇x L gradients, not on any optimizer-smoothed update direction.
+        self.volterra_gradient_source = str(volterra_gradient_source).lower().strip()
+        if self.volterra_gradient_source not in {"pre_optimizer", "post_optimizer"}:
+            self.volterra_gradient_source = "pre_optimizer"
+        self.volterra_optimizer = str(volterra_optimizer).lower().strip().replace("-", "_")
+        self.volterra_optimizer_beta1 = float(volterra_optimizer_beta1)
+        self.volterra_optimizer_beta2 = float(volterra_optimizer_beta2)
+        self.volterra_optimizer_eps = float(volterra_optimizer_eps)
+
         # Thresholds
         self.ETD_THRESHOLD_MODERATE = 0.3
         self.ETD_THRESHOLD_SEVERE = 0.6
+        # Layer 1 spectral features (Paper Section 3.1)
+        self.SPECTRAL_ENTROPY_OBFUSCATED_THRESHOLD = 0.50
+        self.HIGH_FREQ_RATIO_SHATTERED_THRESHOLD = 0.30
         self.ALPHA_RL_THRESHOLD = 0.7
         self.ALPHA_SHATTERED_THRESHOLD = 0.3
         self.GRAD_NORM_SHATTERED_THRESHOLD = 1e-5
@@ -134,6 +156,180 @@ class DefenseAnalyzer:
         # to support failure-mode reporting without affecting core attack logic.
         self.VOLTERRA_RMSE_SCALED_MAX = 1.2
 
+        self._threshold_overrides: Dict[str, Any] = {}
+        if thresholds:
+            self._apply_threshold_overrides(dict(thresholds))
+        # Captures diagnostics from the most recent gradient sampling pass so
+        # characterization artifacts can explain "degenerate" fields.
+        self._last_grad_sample_info: Dict[str, Any] = {}
+
+    def _forward_logits(self, x: torch.Tensor, *, use_bpda: bool) -> torch.Tensor:
+        """
+        Best-effort forward pass that optionally enables BPDA-style approximations.
+
+        Many defenses are wrapped in `DefenseWrapper.forward(x, use_approximation=...)`.
+        For plain `nn.Module` models (no such kwarg), we fall back to `model(x)`.
+        """
+        if use_bpda:
+            try:
+                return self.model(x, use_approximation=True)  # type: ignore[misc]
+            except (TypeError, RuntimeError):
+                return self.model(x)
+        return self.model(x)
+
+    @staticmethod
+    def _is_no_grad_runtime_error(exc: RuntimeError) -> bool:
+        msg = str(exc).lower()
+        return (
+            "does not require grad" in msg
+            or "does not have a grad_fn" in msg
+            or "element 0 of tensors" in msg
+        )
+
+    def _safe_backward(self, loss: torch.Tensor) -> bool:
+        """
+        Backprop helper for characterization.
+
+        Some defenses intentionally break autograd (e.g., hard/argmax-style transforms).
+        For those, we return False so callers can try BPDA/fallback logic.
+        """
+        try:
+            loss.backward()
+            return True
+        except RuntimeError as exc:
+            if self._is_no_grad_runtime_error(exc):
+                return False
+            raise
+
+    def _volterra_preprocess_gradients(self, grad_array: np.ndarray) -> np.ndarray:
+        """
+        Optionally transform gradients before Volterra fitting.
+
+        Motivation (Tier 2 confound control):
+        - Fitting alpha on optimizer-smoothed update directions can "manufacture"
+          temporal memory effects from the optimizer itself (momentum/Adam/RMSProp),
+          which is not defense-induced.
+        - The default ("pre_optimizer") uses raw gradients unchanged.
+        """
+        src = str(getattr(self, "volterra_gradient_source", "pre_optimizer")).lower().strip()
+        if src != "post_optimizer":
+            return grad_array
+
+        opt = str(getattr(self, "volterra_optimizer", "sgd")).lower().strip().replace("-", "_")
+        beta1 = float(getattr(self, "volterra_optimizer_beta1", 0.9))
+        beta2 = float(getattr(self, "volterra_optimizer_beta2", 0.999))
+        eps = float(getattr(self, "volterra_optimizer_eps", 1e-8))
+        eps = max(eps, 1e-12)
+
+        T, D = int(grad_array.shape[0]), int(grad_array.shape[1])
+        if T <= 0 or D <= 0:
+            return grad_array
+
+        out = np.zeros_like(grad_array, dtype=np.float64)
+
+        if opt in {"sgd", "vanilla_sgd"}:
+            out[:] = grad_array
+            return out
+
+        if opt in {"sgd_momentum", "momentum", "sgdm"}:
+            v = np.zeros((D,), dtype=np.float64)
+            b = float(np.clip(beta1, 0.0, 0.9999))
+            for t in range(T):
+                v = b * v + grad_array[t]
+                out[t] = v
+            return out
+
+        if opt in {"rmsprop", "rms_prop"}:
+            s = np.zeros((D,), dtype=np.float64)
+            b = float(np.clip(beta2, 0.0, 0.9999))
+            for t in range(T):
+                g = grad_array[t]
+                s = b * s + (1.0 - b) * (g * g)
+                out[t] = g / (np.sqrt(s) + eps)
+            return out
+
+        if opt in {"adam"}:
+            m = np.zeros((D,), dtype=np.float64)
+            v = np.zeros((D,), dtype=np.float64)
+            b1 = float(np.clip(beta1, 0.0, 0.9999))
+            b2 = float(np.clip(beta2, 0.0, 0.9999))
+            for t in range(T):
+                g = grad_array[t]
+                m = b1 * m + (1.0 - b1) * g
+                v = b2 * v + (1.0 - b2) * (g * g)
+                # Bias correction (standard Adam)
+                t1 = float(t + 1)
+                m_hat = m / (1.0 - (b1**t1)) if b1 < 1.0 else m
+                v_hat = v / (1.0 - (b2**t1)) if b2 < 1.0 else v
+                out[t] = m_hat / (np.sqrt(v_hat) + eps)
+            return out
+
+        # Unknown optimizer key: fall back to raw gradients (do not crash characterization).
+        return grad_array
+
+    def _apply_threshold_overrides(self, overrides: Dict[str, Any]) -> None:
+        """
+        Apply user-provided threshold overrides.
+
+        This exists to support Tier 2 calibration: ROC/AUC-derived operating points
+        can be loaded from JSON and injected here instead of hard-coding values.
+        """
+
+        def _canon(key: str) -> str:
+            return str(key).strip().upper().replace("-", "_")
+
+        allowed = {
+            "ETD_THRESHOLD_MODERATE": float,
+            "ETD_THRESHOLD_SEVERE": float,
+            "SPECTRAL_ENTROPY_OBFUSCATED_THRESHOLD": float,
+            "HIGH_FREQ_RATIO_SHATTERED_THRESHOLD": float,
+            "ALPHA_RL_THRESHOLD": float,
+            "ALPHA_SHATTERED_THRESHOLD": float,
+            "GRAD_NORM_SHATTERED_THRESHOLD": float,
+            "VARIANCE_SHATTERED_THRESHOLD": float,
+            "VARIANCE_STOCHASTIC_THRESHOLD": float,
+            "RANK_VANISHING_THRESHOLD": float,
+            "AUTOCORR_RL_THRESHOLD": float,
+            "KRYLOV_REL_ERROR_SHATTERED": float,
+            "KRYLOV_NORM_RATIO_VANISHING": float,
+            "KRYLOV_NORM_GROWTH_SHATTERED": float,
+            "MIN_GRADIENT_SEQUENCE_LEN": int,
+            "VOLTERRA_RMSE_SCALED_MAX": float,
+        }
+
+        for k, v in overrides.items():
+            ck = _canon(str(k))
+            caster = allowed.get(ck)
+            if caster is None:
+                continue
+            try:
+                casted = caster(v)
+            except Exception:
+                continue
+            setattr(self, ck, casted)
+            self._threshold_overrides[ck] = casted
+
+    def _thresholds_dict(self) -> Dict[str, Any]:
+        return {
+            "ETD_THRESHOLD_MODERATE": float(self.ETD_THRESHOLD_MODERATE),
+            "ETD_THRESHOLD_SEVERE": float(self.ETD_THRESHOLD_SEVERE),
+            "SPECTRAL_ENTROPY_OBFUSCATED_THRESHOLD": float(self.SPECTRAL_ENTROPY_OBFUSCATED_THRESHOLD),
+            "HIGH_FREQ_RATIO_SHATTERED_THRESHOLD": float(self.HIGH_FREQ_RATIO_SHATTERED_THRESHOLD),
+            "ALPHA_RL_THRESHOLD": float(self.ALPHA_RL_THRESHOLD),
+            "ALPHA_SHATTERED_THRESHOLD": float(self.ALPHA_SHATTERED_THRESHOLD),
+            "GRAD_NORM_SHATTERED_THRESHOLD": float(self.GRAD_NORM_SHATTERED_THRESHOLD),
+            "VARIANCE_SHATTERED_THRESHOLD": float(self.VARIANCE_SHATTERED_THRESHOLD),
+            "VARIANCE_STOCHASTIC_THRESHOLD": float(self.VARIANCE_STOCHASTIC_THRESHOLD),
+            "RANK_VANISHING_THRESHOLD": float(self.RANK_VANISHING_THRESHOLD),
+            "AUTOCORR_RL_THRESHOLD": float(self.AUTOCORR_RL_THRESHOLD),
+            "KRYLOV_REL_ERROR_SHATTERED": float(self.KRYLOV_REL_ERROR_SHATTERED),
+            "KRYLOV_NORM_RATIO_VANISHING": float(self.KRYLOV_NORM_RATIO_VANISHING),
+            "KRYLOV_NORM_GROWTH_SHATTERED": float(self.KRYLOV_NORM_GROWTH_SHATTERED),
+            "MIN_GRADIENT_SEQUENCE_LEN": int(self.MIN_GRADIENT_SEQUENCE_LEN),
+            "VOLTERRA_RMSE_SCALED_MAX": float(self.VOLTERRA_RMSE_SCALED_MAX),
+            "overrides_applied": dict(self._threshold_overrides),
+        }
+
     def characterize(
         self,
         data_loader: torch.utils.data.DataLoader,
@@ -146,6 +342,16 @@ class DefenseAnalyzer:
             )
 
         gradients, images, labels = self._collect_gradient_samples(data_loader, eps)
+
+        # Layer 1 (Paper Section 3.1): spectral entropy + high-frequency ratio.
+        # We compute these from the gradient history (T, D) by averaging across D.
+        spectral_layer1: Dict[str, Any] = {}
+        try:
+            if gradients and len(gradients) >= 2:
+                grad_seq = np.asarray(gradients, dtype=np.float64)
+                spectral_layer1 = compute_spectral_features(grad_seq, fs=1.0, hf_ratio=0.25)
+        except Exception:
+            spectral_layer1 = {}
 
         if self.verbose:
             print("[DefenseAnalyzer] Computing ETD score...")
@@ -173,6 +379,9 @@ class DefenseAnalyzer:
         grad_variance = self._compute_gradient_variance(images, labels)
         stochastic_score = self._compute_stochastic_score(images, labels)
         grad_norm_mean = self._compute_gradient_norm_mean(gradients)
+        grad_sample_info = dict(getattr(self, "_last_grad_sample_info", {}) or {})
+        true_grad_none_fraction = float(grad_sample_info.get("true_grad_none_fraction", 0.0))
+        true_grad_zero_fraction = float(grad_sample_info.get("true_grad_zero_fraction", 0.0))
         jacobian_rank = self._estimate_jacobian_rank(images, labels)
         autocorr, timescale = self._compute_autocorrelation(gradients)
         spectral_signals = self._compute_spectral_signals(gradients)
@@ -192,6 +401,8 @@ class DefenseAnalyzer:
             timescale,
             spectral_signals,
             volterra_fit_ok,
+            true_grad_none_fraction=true_grad_none_fraction,
+            true_grad_zero_fraction=true_grad_zero_fraction,
         )
 
         requires_bpda, requires_eot, requires_mapgd = self._recommend_attacks(
@@ -212,6 +423,29 @@ class DefenseAnalyzer:
             n_grad,
         )
 
+        # Paper-aligned (Layer 1) scalars for reporting + calibration.
+        spectral_entropy = float(spectral_layer1.get("spectral_entropy", 0.0)) if spectral_layer1 else 0.0
+        spectral_entropy_norm = (
+            float(spectral_layer1.get("spectral_entropy_norm", 0.0)) if spectral_layer1 else 0.0
+        )
+        high_freq_ratio = float(spectral_layer1.get("high_freq_ratio", 0.0)) if spectral_layer1 else 0.0
+        wavelet_energy = spectral_layer1.get("wavelet_energy", {}) if spectral_layer1 else {}
+        if not isinstance(wavelet_energy, dict):
+            wavelet_energy = {}
+
+        # Paper-style composite verdict (Section 3.5): record as metadata for auditability.
+        # Routing/attack recommendations still use `obfuscation_types` (existing logic).
+        paper_entropy_flag = bool(spectral_entropy_norm > float(self.SPECTRAL_ENTROPY_OBFUSCATED_THRESHOLD))
+        paper_hf_flag = bool(high_freq_ratio > float(self.HIGH_FREQ_RATIO_SHATTERED_THRESHOLD))
+        paper_alpha_flag = bool(volterra_fit_ok and float(alpha_volterra) < float(self.ALPHA_RL_THRESHOLD))
+        paper_triggers: List[str] = []
+        if paper_entropy_flag:
+            paper_triggers.append("spectral_entropy_norm")
+        if paper_hf_flag:
+            paper_triggers.append("high_freq_ratio")
+        if paper_alpha_flag:
+            paper_triggers.append("alpha_volterra")
+
         characterization = DefenseCharacterization(
             obfuscation_types=obfuscation_types,
             etd_score=etd_score,
@@ -226,6 +460,19 @@ class DefenseAnalyzer:
             recommended_memory_length=memory_length,
             confidence=confidence,
             metadata={
+                "spectral_entropy": float(spectral_entropy),
+                "spectral_entropy_norm": float(spectral_entropy_norm),
+                "high_freq_ratio": float(high_freq_ratio),
+                # Draft Section 3.1 (Morlet): include the per-scale CWT energy so
+                # paper↔artifact comparisons are mechanical.
+                "wavelet_energy": {str(k): float(v) for k, v in wavelet_energy.items()},
+                "paper_style": {
+                    "composite_obfuscated": bool(paper_entropy_flag or paper_hf_flag or paper_alpha_flag),
+                    "triggers": list(paper_triggers),
+                    "entropy_obfuscated": bool(paper_entropy_flag),
+                    "high_freq_obfuscated": bool(paper_hf_flag),
+                    "alpha_memory_obfuscated": bool(paper_alpha_flag),
+                },
                 "volterra_rmse": volterra_rmse,
                 "volterra_rmse_scaled": volterra_rmse_scaled,
                 "volterra_fit": volterra_fit_info,
@@ -235,6 +482,8 @@ class DefenseAnalyzer:
                 "volterra_rmse_scaled_threshold": float(self.VOLTERRA_RMSE_SCALED_MAX),
                 "short_gradient_history": bool(short_grad_history),
                 "min_recommended_gradient_samples": int(self.MIN_GRADIENT_SEQUENCE_LEN),
+                "thresholds": self._thresholds_dict(),
+                "gradient_sampling": grad_sample_info,
                 "autocorrelation": autocorr.tolist()
                 if isinstance(autocorr, np.ndarray)
                 else autocorr,
@@ -279,29 +528,96 @@ class DefenseAnalyzer:
         delta.requires_grad = True
 
         gradients: List[np.ndarray] = []
+        none_steps = 0
+        zero_steps = 0
+        bpda_fallback_steps = 0
+        invalid_steps = 0
+        backward_error_steps = 0
+
+        # Cache whether the defended model *appears* to support the BPDA kwarg.
+        # (We still guard with try/except in `_forward_logits`.)
+        bpda_kwarg_supported = True
+        try:
+            _ = self.model(images[:1], use_approximation=False)  # type: ignore[misc]
+        except (TypeError, RuntimeError):
+            bpda_kwarg_supported = False
 
         for _ in range(self.n_samples):
-            logits = self.model(images + delta)
+            # First try the "true" backward pass (no approximation). If the defense
+            # breaks autograd (e.g., PIL JPEG), `delta.grad` can become None.
+            logits = self._forward_logits(images + delta, use_bpda=False)
             loss = F.cross_entropy(logits, labels)
-
             self.model.zero_grad()
             if delta.grad is not None:
                 delta.grad.zero_()
-            loss.backward()
+            true_backward_ok = self._safe_backward(loss)
+            if not true_backward_ok:
+                backward_error_steps += 1
 
-            if delta.grad is None:
+            grad = delta.grad if true_backward_ok else None
+            grad_ok = False
+            if grad is None:
+                none_steps += 1
+            else:
+                if not torch.isfinite(grad).all():
+                    invalid_steps += 1
+                else:
+                    # If the graph does not depend on `delta` but `delta.grad` was
+                    # previously allocated, it can remain as an all-zero tensor.
+                    # Treat exact-all-zero as a broken/shattered gradient signal.
+                    if float(grad.detach().abs().sum().item()) == 0.0:
+                        zero_steps += 1
+                    else:
+                        grad_ok = True
+            if not grad_ok:
+                # Fall back to BPDA-style approximation if the model supports it.
+                if bpda_kwarg_supported:
+                    self.model.zero_grad()
+                    if delta.grad is not None:
+                        delta.grad.zero_()
+                    logits = self._forward_logits(images + delta, use_bpda=True)
+                    loss = F.cross_entropy(logits, labels)
+                    bpda_backward_ok = self._safe_backward(loss)
+                    if not bpda_backward_ok:
+                        backward_error_steps += 1
+                    grad = delta.grad if bpda_backward_ok else None
+                    if (
+                        grad is not None
+                        and torch.isfinite(grad).all()
+                        and float(grad.detach().abs().sum().item()) > 0.0
+                    ):
+                        bpda_fallback_steps += 1
+
+            if grad is None or not torch.isfinite(grad).all() or float(grad.detach().abs().sum().item()) == 0.0:
                 grad = torch.zeros_like(delta)
             else:
-                grad = delta.grad.detach().clone()
+                grad = grad.detach().clone()
             grad_flat = grad.view(grad.size(0), -1).cpu().numpy()
             gradients.append(grad_flat.mean(axis=0))
 
             with torch.no_grad():
+                # Use the best-effort gradient to "walk" delta; otherwise a single
+                # None/zero gradient would freeze the entire history at zeros.
                 delta.data = delta + (2 / 255) * grad.sign()
                 delta.data = torch.clamp(delta, -eps, eps)
                 delta.data = torch.clamp(images + delta, x_min, x_max) - images
 
             delta.requires_grad = True
+
+        # Publish sampling diagnostics for auditability.
+        total_steps = int(max(1, self.n_samples))
+        self._last_grad_sample_info = {
+            "bpda_kwarg_supported": bool(bpda_kwarg_supported),
+            "true_grad_none_steps": int(none_steps),
+            "true_grad_zero_steps": int(zero_steps),
+            "true_grad_invalid_steps": int(invalid_steps),
+            "backward_error_steps": int(backward_error_steps),
+            "bpda_fallback_steps": int(bpda_fallback_steps),
+            "total_steps": int(total_steps),
+            "true_grad_none_fraction": float(none_steps) / float(total_steps),
+            "true_grad_zero_fraction": float(zero_steps) / float(total_steps),
+            "bpda_fallback_fraction": float(bpda_fallback_steps) / float(total_steps),
+        }
 
         return gradients, images, labels
 
@@ -322,7 +638,16 @@ class DefenseAnalyzer:
 
         was_training = self.model.training
         pgd = PGD(self.model, eps=eps, steps=40, device=self.device)
-        x_adv = pgd(images, labels)
+        try:
+            x_adv = pgd(images, labels)
+        except RuntimeError as exc:
+            if self._is_no_grad_runtime_error(exc):
+                warnings.warn(
+                    "ETD score fallback: PGD backward unavailable for this defense; "
+                    "using etd_score=0.0"
+                )
+                return 0.0
+            raise
 
         dist_adv = (images - x_adv).pow(2).view(images.size(0), -1).sum(dim=1)
         view_shape = (-1,) + (1,) * (images.ndim - 1)
@@ -363,8 +688,15 @@ class DefenseAnalyzer:
         if not gradients:
             return 0.5, np.nan, np.nan, {"success": False, "message": "empty gradient sequence"}
 
-        grad_array = np.array(gradients, dtype=np.float64)
-        info_out: Dict[str, Any] = {}
+        grad_array_raw = np.array(gradients, dtype=np.float64)
+        grad_array = self._volterra_preprocess_gradients(grad_array_raw)
+        info_out: Dict[str, Any] = {
+            "gradient_source": str(getattr(self, "volterra_gradient_source", "pre_optimizer")),
+            "optimizer": str(getattr(self, "volterra_optimizer", "sgd")),
+            "optimizer_beta1": float(getattr(self, "volterra_optimizer_beta1", 0.9)),
+            "optimizer_beta2": float(getattr(self, "volterra_optimizer_beta2", 0.999)),
+            "optimizer_eps": float(getattr(self, "volterra_optimizer_eps", 1e-8)),
+        }
         try:
             kernel, rmse, info = fit_volterra_kernel(
                 grad_array,
@@ -400,16 +732,28 @@ class DefenseAnalyzer:
         if images.size(0) == 0:
             return 0.0
         delta = torch.zeros_like(images, requires_grad=True)
-        logits = self.model(images + delta)
+        logits = self._forward_logits(images + delta, use_bpda=False)
         loss = F.cross_entropy(logits, labels)
         self.model.zero_grad()
         if delta.grad is not None:
             delta.grad.zero_()
-        loss.backward()
-        if delta.grad is None:
+        backward_ok = self._safe_backward(loss)
+
+        grad = delta.grad if backward_ok else None
+        if grad is None or not torch.isfinite(grad).all() or float(grad.detach().abs().sum().item()) == 0.0:
+            # Try BPDA approximation so variance isn't silently zeroed.
+            self.model.zero_grad()
+            if delta.grad is not None:
+                delta.grad.zero_()
+            logits = self._forward_logits(images + delta, use_bpda=True)
+            loss = F.cross_entropy(logits, labels)
+            bpda_ok = self._safe_backward(loss)
+            grad = delta.grad if bpda_ok else None
+
+        if grad is None or not torch.isfinite(grad).all() or float(grad.detach().abs().sum().item()) == 0.0:
             grad = torch.zeros_like(delta)
         else:
-            grad = delta.grad.detach()
+            grad = grad.detach()
         grad_flat = grad.view(grad.size(0), -1)
         var = grad_flat.var(unbiased=False).item()
         scale = float(grad_flat.shape[1]) * 1_000_000.0
@@ -451,15 +795,25 @@ class DefenseAnalyzer:
         x_sample = images[indices].requires_grad_(True)
         y_sample = labels[indices]
 
-        logits = self.model(x_sample)
+        logits = self._forward_logits(x_sample, use_bpda=False)
         loss = F.cross_entropy(logits, y_sample)
         self.model.zero_grad()
-        loss.backward()
+        backward_ok = self._safe_backward(loss)
 
-        if x_sample.grad is None:
+        grad = x_sample.grad if backward_ok else None
+        if grad is None or not torch.isfinite(grad).all() or float(grad.detach().abs().sum().item()) == 0.0:
+            # Best-effort BPDA fallback for non-differentiable transforms.
+            self.model.zero_grad()
+            x_sample.grad = None
+            logits = self._forward_logits(x_sample, use_bpda=True)
+            loss = F.cross_entropy(logits, y_sample)
+            bpda_ok = self._safe_backward(loss)
+            grad = x_sample.grad if bpda_ok else None
+
+        if grad is None or not torch.isfinite(grad).all() or float(grad.detach().abs().sum().item()) == 0.0:
             grad = torch.zeros_like(x_sample)
         else:
-            grad = x_sample.grad.detach()
+            grad = grad.detach()
         grad_flat = grad.view(n, -1).cpu().numpy()
         if not np.any(grad_flat):
             return 0.0
@@ -531,8 +885,21 @@ class DefenseAnalyzer:
         timescale: float,
         spectral_signals: Dict[str, float],
         volterra_fit_ok: bool,
+        *,
+        true_grad_none_fraction: float = 0.0,
+        true_grad_zero_fraction: float = 0.0,
     ) -> List[ObfuscationType]:
         obfuscation_types: List[ObfuscationType] = []
+
+        # If autograd breaks (grad is None) for a non-trivial fraction of probes,
+        # treat this as strong evidence of shattered / non-differentiable defenses.
+        if float(true_grad_none_fraction) > 0.10 or float(true_grad_zero_fraction) > 0.50:
+            obfuscation_types.append(ObfuscationType.SHATTERED)
+            if self.verbose:
+                print(
+                    "  [DETECTED] Shattered gradients "
+                    f"(true_none={float(true_grad_none_fraction):.2f}, true_zero={float(true_grad_zero_fraction):.2f})"
+                )
 
         if grad_norm_mean < self.GRAD_NORM_SHATTERED_THRESHOLD:
             obfuscation_types.append(ObfuscationType.SHATTERED)
@@ -557,9 +924,9 @@ class DefenseAnalyzer:
                     f"  [DETECTED] Vanishing gradients (rank={jacobian_rank:.3f} < 0.5)"
                 )
 
-        rel_error_mean = float(spectral_signals.get("rel_error_mean", 0.0))
+        _rel_error_mean = float(spectral_signals.get("rel_error_mean", 0.0))
         norm_ratio_mean = float(spectral_signals.get("norm_ratio_mean", 1.0))
-        norm_growth_fraction = float(spectral_signals.get("norm_growth_fraction", 0.0))
+        _norm_growth_fraction = float(spectral_signals.get("norm_growth_fraction", 0.0))
 
         # Note: we compute Krylov diagnostics for reporting and future analysis,
         # but we do not classify "SHATTERED" purely from reconstruction error /

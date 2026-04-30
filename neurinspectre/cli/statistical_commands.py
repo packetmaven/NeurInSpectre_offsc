@@ -305,7 +305,7 @@ def register_statistical_commands(subparsers) -> None:
     drift.add_argument(
         "--methods",
         default="hotelling,ks,bayesian",
-        help="Comma-separated methods: hotelling, ks, bayesian (default: all)",
+        help="Comma-separated methods: hotelling, ks, mmd, ks_ad_cvm, bayesian (default: hotelling,ks,bayesian)",
     )
     drift.add_argument("--confidence-level", type=float, default=0.95, help="Confidence level (default: 0.95)")
     drift.add_argument("--output", "-o", help="Write JSON results to this path (otherwise prints JSON)")

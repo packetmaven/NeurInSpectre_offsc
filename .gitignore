@@ -218,6 +218,18 @@ absolutely_fixed_dropdown_dashboard_*.py
 
 # Generated outputs (exclude from git - users generate their own)
 _cli_runs/
+_cli_smokes/
+_output/
+_smoke/
+_recon/
+_stealth/
+_baselines/
+_forensics/
+_defense/
+_analysis/
+_audits/
+_external_overlay/
+_tmp/
 viz/
 output/
 results/
@@ -300,6 +312,11 @@ adversarial_robustness_toolbox/
 !LICENSE.md
 !AE.md
 !DRAFT_CODE_AUDIT.md
+!README_OFFSEC.md
+!README_DETECTION.md
+!README_FRAMEWORK_LEGACY.md
+!QUICKSTART_CCS.md
+!QUICKSTART_CCS_OFFENSIVE.md
 !docs/guides/*.md
 !docs/research/*.md
 !docs/README_INDEX.md
@@ -326,3 +343,16 @@ models/cifar10/
 
 # Unit-test fixture (small) needed for repo tests.
 !tests/fixtures/test_model.pth
+
+# Paper sources — submitted via HotCRP, not part of the public artifact.
+main.tex
+main_offensive.tex
+main_offensive.bbl
+main_offensive.aux
+main_offensive.blg
+main_offensive.out
+main_offensive.log
+main_offensive.synctex.gz
+references.bib
+references_offensive.bib
+REPO_DESCRIPTION.txt

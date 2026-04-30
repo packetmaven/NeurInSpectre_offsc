@@ -35,7 +35,7 @@ Attack Methodology:
 
 MITRE ATLAS Mapping: AML.T0043 (Craft Adversarial Data)
 
-Author: packetmaven
+Author: NeurInSpectre Security Team
 License: GPL-3.0
 """
 

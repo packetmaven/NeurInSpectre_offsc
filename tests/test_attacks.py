@@ -7,6 +7,7 @@ from neurinspectre.attacks import (
     BPDA,
     EOT,
     FAB,
+    AutoAttack,
     AutoAttackEnsemble,
     MemoryAugmentedPGD,
     PGD,
@@ -179,3 +180,12 @@ def test_autoattack_ensemble_runs_cpu():
     ensemble = AutoAttackEnsemble(model, attacks, device="cpu")
     adv = ensemble(x, y)
     assert adv.shape == x.shape
+
+
+def test_autoattack_bounds_cpu():
+    model = ToyModel()
+    x, y = _make_batch()
+    attack = AutoAttack(model, norm="linf", eps=0.1, version="standard", device="cpu")
+    adv, _metrics = attack.run(x, y, verbose=False)
+    assert adv.shape == x.shape
+    assert float((adv - x).abs().max()) <= 0.1001

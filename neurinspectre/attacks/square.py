@@ -120,45 +120,77 @@ class SquareAttack(Attack):
 
         for query in range(self.n_queries):
             p = self._square_size_schedule(query)
-            delta_new = delta.clone()
+            # Optimization: only evaluate the remaining not-yet-successful subset.
+            # This preserves the algorithm's semantics while dramatically reducing
+            # compute for attacks where many samples become adversarial early.
+            active_idx = (~success).nonzero(as_tuple=False).squeeze(1)
+            if active_idx.numel() == 0:
+                if verbose:
+                    print(f"[Square Attack] All samples adversarial at query {query}/{self.n_queries}")
+                break
 
-            for b in range(batch_size):
-                if success[b]:
-                    continue
+            x_active = x[active_idx]
+            y_active = y[active_idx]
+            delta_active = delta[active_idx]
+            loss_best_active = loss_best[active_idx]
 
-                h_start, h_end, w_start, w_end = self._get_square_coordinates((h, w), p)
-                square_delta = torch.zeros_like(delta[b])
-                square_delta[:, h_start:h_end, w_start:w_end] = torch.zeros_like(
-                    delta[b, :, h_start:h_end, w_start:w_end]
-                ).uniform_(-self.eps, self.eps)
+            delta_new_active = delta_active.clone()
+            active_bs = int(delta_new_active.size(0))
 
-                delta_new[b] = delta[b].clone()
-                delta_new[b, :, h_start:h_end, w_start:w_end] = square_delta[:, h_start:h_end, w_start:w_end]
-                delta_new[b] = torch.clamp(delta_new[b], -self.eps, self.eps)
-                delta_new[b] = torch.clamp(x[b] + delta_new[b], 0, 1) - x[b]
+            # Vectorized patch update (no Python loop over samples).
+            s_h = max(1, int(np.sqrt(float(p)) * h))
+            s_w = max(1, int(np.sqrt(float(p)) * w))
+            h_start = torch.from_numpy(
+                np.random.randint(0, h - s_h + 1, size=(active_bs,), dtype=np.int64)
+            ).to(device=delta_new_active.device)
+            w_start = torch.from_numpy(
+                np.random.randint(0, w - s_w + 1, size=(active_bs,), dtype=np.int64)
+            ).to(device=delta_new_active.device)
+
+            rows = h_start[:, None] + torch.arange(s_h, device=delta_new_active.device)[None, :]
+            cols = w_start[:, None] + torch.arange(s_w, device=delta_new_active.device)[None, :]
+
+            patch = torch.empty(
+                (active_bs, c, s_h, s_w),
+                device=delta_new_active.device,
+                dtype=delta_new_active.dtype,
+            ).uniform_(-self.eps, self.eps)
+
+            b_idx = torch.arange(active_bs, device=delta_new_active.device)[:, None, None, None]
+            ch_idx = torch.arange(c, device=delta_new_active.device)[None, :, None, None]
+            r_idx = rows[:, None, :, None]
+            c_idx = cols[:, None, None, :]
+            delta_new_active[b_idx, ch_idx, r_idx, c_idx] = patch
+
+            delta_new_active.clamp_(-self.eps, self.eps)
+            delta_new_active = torch.clamp(x_active + delta_new_active, 0, 1) - x_active
 
             with torch.no_grad():
-                logits_new = self.model(x + delta_new)
+                logits_new_active = self.model(x_active + delta_new_active)
                 if self.loss_type == "margin":
-                    loss_new = self._margin_loss(logits_new, y, targeted)
+                    loss_new_active = self._margin_loss(logits_new_active, y_active, targeted)
                 else:
-                    loss_new = F.cross_entropy(logits_new, y, reduction="none")
+                    loss_new_active = F.cross_entropy(logits_new_active, y_active, reduction="none")
                     if targeted:
-                        loss_new = -loss_new
+                        loss_new_active = -loss_new_active
 
-                improved = loss_new > loss_best
-                if improved.any():
-                    delta[improved] = delta_new[improved]
-                    loss_best[improved] = loss_new[improved]
+                improved_active = loss_new_active > loss_best_active
+                if improved_active.any():
+                    improved_idx = active_idx[improved_active]
+                    delta[improved_idx] = delta_new_active[improved_active]
+                    loss_best[improved_idx] = loss_new_active[improved_active]
 
-                queries_used += (~success).float()
+                # Each active sample consumes one query this iteration.
+                queries_used[active_idx] += 1.0
 
-                preds = logits_new.argmax(1)
+                preds = logits_new_active.argmax(1)
                 if targeted:
-                    candidate_success = preds == y
+                    candidate_success = preds == y_active
                 else:
-                    candidate_success = preds != y
-                success = success | (candidate_success & improved)
+                    candidate_success = preds != y_active
+                newly_success = candidate_success & improved_active
+                if newly_success.any():
+                    success[active_idx[newly_success]] = True
 
             if success.all():
                 if verbose:

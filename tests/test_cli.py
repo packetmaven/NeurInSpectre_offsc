@@ -9,6 +9,8 @@ def test_attack_help():
     runner = CliRunner()
     result = runner.invoke(cli, ["attack", "--help"])
     assert result.exit_code == 0
+    assert "--threshold-overrides" in result.output
+    assert "tent" in result.output
 
 
 def test_attack_run(tmp_path):
@@ -46,6 +48,8 @@ def test_characterize_help():
     runner = CliRunner()
     result = runner.invoke(cli, ["characterize", "--help"])
     assert result.exit_code == 0
+    assert "--threshold-overrides" in result.output
+    assert "tent" in result.output
 
 
 def test_characterize_run(tmp_path):

@@ -266,6 +266,40 @@ def test_characterization_accuracy():
     assert accuracy >= 0.75
 
 
+def test_defense_analyzer_threshold_overrides_reflected_in_metadata():
+    _seed_all()
+    model = SimpleConvNet()
+    model.eval()
+
+    test_loader = create_dummy_loader(n_batches=2, batch_size=20)
+    overrides = {"ETD_THRESHOLD_SEVERE": 0.123, "ALPHA_RL_THRESHOLD": 0.456}
+    analyzer = DefenseAnalyzer(model, n_samples=30, device="cpu", verbose=False, thresholds=overrides)
+    char = analyzer.characterize(test_loader)
+
+    thresholds_meta = (char.metadata or {}).get("thresholds") or {}
+    assert thresholds_meta.get("ETD_THRESHOLD_SEVERE") == pytest.approx(0.123)
+    assert thresholds_meta.get("ALPHA_RL_THRESHOLD") == pytest.approx(0.456)
+    assert (thresholds_meta.get("overrides_applied") or {}).get("ETD_THRESHOLD_SEVERE") == pytest.approx(
+        0.123
+    )
+
+
+def test_characterization_includes_layer1_spectral_metrics():
+    _seed_all()
+    model = SimpleConvNet()
+    model.eval()
+
+    test_loader = create_dummy_loader(n_batches=2, batch_size=20)
+    analyzer = DefenseAnalyzer(model, n_samples=30, device="cpu", verbose=False)
+    char = analyzer.characterize(test_loader)
+
+    meta = char.metadata or {}
+    assert 0.0 <= float(meta.get("spectral_entropy_norm", 0.0)) <= 1.0
+    assert 0.0 <= float(meta.get("high_freq_ratio", 0.0)) <= 1.0
+    paper_style = meta.get("paper_style") or {}
+    assert "composite_obfuscated" in paper_style
+
+
 def test_etd_score_computation():
     _seed_all()
     model = SimpleConvNet()

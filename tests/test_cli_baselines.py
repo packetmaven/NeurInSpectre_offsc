@@ -11,6 +11,12 @@ def test_baselines_help():
     assert result.exit_code == 0
 
 
+def test_baselines_frameworks_help():
+    runner = CliRunner()
+    result = runner.invoke(cli, ["baselines", "frameworks", "--help"])
+    assert result.exit_code == 0
+
+
 def test_attention_spotlighting_scan_writes_json(tmp_path):
     runner = CliRunner()
     out = tmp_path / "scan.json"

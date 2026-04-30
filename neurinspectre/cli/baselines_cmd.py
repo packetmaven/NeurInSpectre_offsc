@@ -34,9 +34,10 @@ from ..baselines.prompt_injection import (
     scan_rebuff,
     spotlight_wrap_prompt,
 )
+from ..baselines.frameworks_compare import run_framework_head_to_head
 from ..baselines.text_attacks import run_textattack_recipe
 from ..models.cifar10 import load_cifar10_model
-from .utils import load_dataset, resolve_device, save_json, set_seed
+from .utils import build_defense, load_dataset, resolve_device, save_json, set_seed
 
 
 def _jsonify(obj: Any) -> Any:
@@ -412,6 +413,184 @@ def ednn_textattack(**kwargs: Any) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_json({"module": "ednn", "baseline": "textattack", "result": res.to_dict()}, out_path)
     click.echo(str(out_path))
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: Framework head-to-head baselines (ART/Foolbox)
+# ---------------------------------------------------------------------------
+
+
+@baselines_cmd.group("frameworks")
+def frameworks_group() -> None:
+    """Head-to-head attack framework comparisons (Tier 2)."""
+
+
+@frameworks_group.command("compare")
+@click.option("--dataset", type=click.Choice(["cifar10"]), default="cifar10", show_default=True)
+@click.option("--data-path", type=click.Path(), default="./data/cifar10", show_default=True)
+@click.option("--model", "model_name", type=str, default="resnet20", show_default=True)
+@click.option(
+    "--defense",
+    "defenses",
+    multiple=True,
+    type=click.Choice(["none", "thermometer_encoding", "defensive_distillation"]),
+    default=("thermometer_encoding", "defensive_distillation"),
+    show_default=True,
+    help="Repeat flag to compare multiple defenses",
+)
+@click.option(
+    "--framework",
+    "frameworks",
+    multiple=True,
+    type=click.Choice(["neurinspectre", "art_apgd", "foolbox_pgd"]),
+    default=("neurinspectre", "art_apgd", "foolbox_pgd"),
+    show_default=True,
+    help="Repeat flag to compare multiple frameworks",
+)
+@click.option("--epsilon", type=float, default=8 / 255, show_default=True)
+@click.option("--norm", type=click.Choice(["linf", "l2"]), default="linf", show_default=True)
+@click.option("--steps", type=int, default=40, show_default=True)
+@click.option("--restarts", type=int, default=1, show_default=True)
+@click.option(
+    "--eps-step",
+    "eps_step",
+    type=float,
+    default=None,
+    help="Attack step size used by ART/Foolbox (defaults to a budget-derived heuristic)",
+)
+@click.option("--thermometer-levels", type=int, default=16, show_default=True)
+@click.option("--distill-temperature", type=float, default=20.0, show_default=True)
+@click.option("--characterization-samples", type=int, default=50, show_default=True)
+@click.option("--volterra-mode", type=click.Choice(["auto", "on", "off"]), default="auto", show_default=True)
+@click.option("--num-samples", type=int, default=256, show_default=True)
+@click.option("--batch-size", type=int, default=64, show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--device", type=click.Choice(["cuda", "cpu", "mps", "auto"]), default="auto", show_default=True)
+@click.option("--output-dir", type=click.Path(), default="results/framework_compare", show_default=True)
+@click.option("--fail-fast/--continue-on-error", default=True, show_default=True)
+def frameworks_compare(**kwargs: Any) -> None:
+    """
+    Compare NeurInSpectre vs baseline frameworks on identical budgets.
+
+    Outputs per-defense JSON artifacts with:
+    - clean_accuracy
+    - robust_accuracy
+    - attack_success_rate (ASR, conditional on originally-correct samples)
+    - runtime_seconds
+
+    Notes:
+    - ART baseline uses AutoProjectedGradientDescent (APGD).
+    - Foolbox baseline uses its native PGD implementation (Foolbox does not ship APGD).
+    """
+    dataset = str(kwargs["dataset"])
+    data_path = str(kwargs["data_path"])
+    model_name = str(kwargs["model_name"])
+    defenses = [str(d) for d in (kwargs.get("defenses") or ())]
+    frameworks = [str(f) for f in (kwargs.get("frameworks") or ())]
+    eps = float(kwargs["epsilon"])
+    norm = str(kwargs["norm"])
+    steps = int(kwargs["steps"])
+    restarts = int(kwargs["restarts"])
+    eps_step = kwargs.get("eps_step")
+    if eps_step is not None:
+        eps_step = float(eps_step)
+    thermo_levels = int(kwargs["thermometer_levels"])
+    distill_temp = float(kwargs["distill_temperature"])
+    char_samples = int(kwargs["characterization_samples"])
+    volterra_mode = str(kwargs["volterra_mode"])
+    num_samples = int(kwargs["num_samples"])
+    batch_size = int(kwargs["batch_size"])
+    seed = int(kwargs["seed"])
+    device = resolve_device(kwargs.get("device", "auto"))
+    out_dir = Path(str(kwargs["output_dir"]))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fail_fast = bool(kwargs.get("fail_fast", True))
+
+    set_seed(seed)
+
+    loader, _x, _y = load_dataset(
+        dataset,
+        data_path=data_path,
+        num_samples=num_samples,
+        batch_size=batch_size,
+        seed=seed,
+        device=device,
+    )
+
+    for defense_name in defenses:
+        # Build fresh model per framework to avoid cross-framework contamination
+        # (ART can move models internally, and some defenses are stateful).
+        def _build_models_for_frameworks() -> Dict[str, Any]:
+            built: Dict[str, Any] = {}
+            for fw in frameworks:
+                base = load_cifar10_model(model_name=model_name, pretrained=True, device=device, normalize=True)
+                params: Dict[str, Any] = {}
+                if defense_name == "thermometer_encoding":
+                    params = {"levels": int(thermo_levels)}
+                elif defense_name == "defensive_distillation":
+                    params = {"temperature": float(distill_temp)}
+                defense_model = build_defense(defense_name, base, params, device=device)
+                eval_model = defense_model or base
+                built[str(fw).lower()] = (eval_model, defense_model)
+            return built
+
+        built_models = _build_models_for_frameworks()
+
+        def eval_model_factory(fw_key: str):
+            key = str(fw_key).lower().strip()
+            if key not in built_models:
+                raise KeyError(f"Unknown framework key requested by evaluator: {fw_key!r}")
+            return built_models[key]
+
+        try:
+            results = run_framework_head_to_head(
+                data_loader=loader,
+                eval_model_factory=eval_model_factory,
+                eps=eps,
+                norm=norm,
+                steps=steps,
+                restarts=restarts,
+                batch_size=batch_size,
+                num_samples=num_samples,
+                device=device,
+                eps_step=eps_step,
+                fail_fast=fail_fast,
+                frameworks=tuple(frameworks),
+                neurinspectre_raw_config={
+                    "characterization_samples": int(char_samples),
+                    "volterra_mode": str(volterra_mode),
+                },
+            )
+        except (ImportError, RuntimeError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        payload = {
+            "module": "framework_compare",
+            "config": {
+                "dataset": dataset,
+                "data_path": data_path,
+                "model": {"name": model_name, "pretrained": True, "normalize": True},
+                "defense": defense_name,
+                "epsilon": eps,
+                "norm": norm,
+                "steps": steps,
+                "restarts": restarts,
+                "eps_step": eps_step,
+                "seed": seed,
+                "device": device,
+                "num_samples": num_samples,
+                "batch_size": batch_size,
+                "volterra_mode": volterra_mode,
+                "characterization_samples": char_samples,
+                "thermometer_levels": thermo_levels,
+                "distill_temperature": distill_temp,
+            },
+            "results": {k: v.to_dict() for k, v in results.items()},
+        }
+
+        out_path = out_dir / f"framework_compare_{dataset}_{defense_name}_{norm}_eps{eps:.6f}.json"
+        save_json(payload, out_path)
+        click.echo(str(out_path))
 
 
 # ---------------------------------------------------------------------------

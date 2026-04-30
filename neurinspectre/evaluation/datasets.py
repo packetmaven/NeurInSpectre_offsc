@@ -25,6 +25,31 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from PIL import Image
 
 
+def _safe_extract_tar(tar: tarfile.TarFile, dest_dir: Path) -> None:
+    """
+    Safely extract a tar archive into `dest_dir`.
+
+    We explicitly reject absolute paths, parent traversal, and symlinks/hardlinks.
+    This avoids common tar extraction vulnerabilities.
+    """
+
+    dest_dir = Path(dest_dir).resolve()
+    for member in tar.getmembers():
+        name = str(member.name)
+        if not name or name.startswith("/"):
+            raise RuntimeError(f"Refusing to extract unsafe tar member: {name!r}")
+        parts = Path(name).parts
+        if any(p == ".." for p in parts):
+            raise RuntimeError(f"Refusing to extract tar member with '..': {name!r}")
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"Refusing to extract symlink/hardlink from tar: {name!r}")
+        target = (dest_dir / name).resolve()
+        if dest_dir not in target.parents and target != dest_dir:
+            raise RuntimeError(f"Refusing to extract tar member outside destination: {name!r}")
+
+    tar.extractall(path=str(dest_dir))
+
+
 class DatasetConfig:
     """Configuration for dataset loading."""
 
@@ -183,6 +208,56 @@ class EMBERDataset:
     """EMBER malware detection dataset."""
 
     @staticmethod
+    def _read_vectorized_memmaps(data_dir: str, *, subset: str) -> Tuple[np.memmap, np.memmap]:
+        """
+        Read EMBER vectorized features from memmap-backed `.dat` files.
+
+        This avoids importing the upstream `ember` package (which transitively
+        imports heavyweight optional deps like `lightgbm`) and lets us sample
+        without materializing the full dataset in RAM.
+        """
+        subset = str(subset).lower().strip()
+        if subset not in {"train", "test"}:
+            raise ValueError(f"subset must be 'train' or 'test', got {subset!r}")
+
+        x_path = os.path.join(data_dir, f"X_{subset}.dat")
+        y_path = os.path.join(data_dir, f"y_{subset}.dat")
+        if not (os.path.exists(x_path) and os.path.exists(y_path)):
+            raise FileNotFoundError(
+                "Missing vectorized EMBER files. Expected:\n"
+                f"  - {x_path}\n"
+                f"  - {y_path}\n"
+                "From scratch:\n"
+                "  1) Download/extract raw shards: python scripts/download_ember2018.py\n"
+                "  2) Vectorize (macOS-safe): python scripts/vectorize_ember_safe.py\n"
+                "Raw shards should end up under `data/ember/ember2018/`."
+            )
+
+        # `scripts/vectorize_ember_safe.py` writes float32 for both X and y.
+        y_bytes = int(os.path.getsize(y_path))
+        x_bytes = int(os.path.getsize(x_path))
+        if y_bytes % 4 != 0 or x_bytes % 4 != 0:
+            raise ValueError("EMBER .dat files must be float32-aligned (size % 4 == 0)")
+
+        n = y_bytes // 4
+        if n <= 0:
+            raise ValueError("EMBER label file is empty")
+
+        n_floats = x_bytes // 4
+        if n_floats % n != 0:
+            raise ValueError(
+                "EMBER feature file size is not divisible by label count. "
+                f"floats={n_floats} labels={n}"
+            )
+        d = n_floats // n
+        if d <= 0:
+            raise ValueError("EMBER feature dimension inferred as <= 0")
+
+        x_mm = np.memmap(x_path, dtype=np.float32, mode="r", shape=(n, d))
+        y_mm = np.memmap(y_path, dtype=np.float32, mode="r", shape=(n,))
+        return x_mm, y_mm
+
+    @staticmethod
     def download_ember(root: str, year: str = "2018") -> None:
         os.makedirs(root, exist_ok=True)
         base_url = "https://ember.elastic.co/ember_dataset_2018_2.tar.bz2"
@@ -197,7 +272,7 @@ class EMBERDataset:
         if not os.path.exists(extract_path):
             print("[EMBER] Extracting...")
             with tarfile.open(tar_path, "r:bz2") as tar:
-                tar.extractall(root)
+                _safe_extract_tar(tar, Path(root))
             print("[EMBER] Extraction complete.")
 
     @staticmethod
@@ -210,33 +285,30 @@ class EMBERDataset:
         split: str = "test",
         pin_memory: bool = True,
     ) -> Tuple[DataLoader, torch.Tensor, torch.Tensor]:
-        EMBERDataset.download_ember(root)
-        try:
-            import ember
-        except ImportError as exc:
-            raise ImportError("Please install ember: pip install ember") from exc
-
-        data_dir = os.path.join(root, "ember_2018")
         subset = "train" if str(split).lower() in {"train", "training"} else "test"
-        x_test, y_test = ember.read_vectorized_features(data_dir, subset=subset)
+        data_dir = os.path.join(root, "ember_2018")
 
-        # ``ember.read_vectorized_features`` can return read-only memmap-backed
-        # arrays; copy to writable buffers before converting to tensors.
-        x_test = torch.from_numpy(np.array(x_test, copy=True)).float()
-        y_test = torch.from_numpy(np.array(y_test, copy=True)).long()
+        # Prefer the memmap path (no `ember` import required). This is the artifact
+        # format we ship for AE; it also avoids loading ~GBs of data into RAM.
+        x_mm, y_mm = EMBERDataset._read_vectorized_memmaps(data_dir, subset=subset)
 
-        labeled_mask = y_test >= 0
-        x_test = x_test[labeled_mask]
-        y_test = y_test[labeled_mask]
+        # Filter out unlabeled samples (-1). We only materialize the chosen subset.
+        y_arr = np.asarray(y_mm, dtype=np.float32)
+        labeled_idx = np.nonzero(y_arr >= 0)[0]
+        if labeled_idx.size == 0:
+            raise ValueError("EMBER vectorized labels contain no labeled samples (y >= 0).")
 
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if n_samples <= 0 or n_samples >= len(x_test):
-            indices = torch.arange(len(x_test))
+        rng = np.random.default_rng(int(seed))
+        if n_samples <= 0 or int(n_samples) >= int(labeled_idx.size):
+            chosen = labeled_idx
         else:
-            indices = torch.randperm(len(x_test))[:n_samples]
-        x_test = x_test[indices]
-        y_test = y_test[indices]
+            chosen = rng.choice(labeled_idx, size=int(n_samples), replace=False)
+
+        x_sel = np.array(x_mm[chosen], copy=True)
+        y_sel = np.array(y_arr[chosen].astype(np.int64, copy=False), copy=True)
+
+        x_test = torch.from_numpy(x_sel).float()
+        y_test = torch.from_numpy(y_sel).long()
 
         dataset = torch.utils.data.TensorDataset(x_test, y_test)
         loader = DataLoader(

@@ -130,6 +130,19 @@ class ModelFactory:
         device: str,
         **kwargs,
     ) -> nn.Module:
+        if training_type in {"robustbench", "rb"}:
+            threat_model = str(kwargs.get("threat_model", "Linf"))
+            model_dir = kwargs.get("model_dir")
+            if model_dir is not None:
+                model_dir = str(model_dir)
+            return cls._load_robustbench_direct(
+                rb_model_name=str(model_name),
+                dataset=str(dataset),
+                threat_model=threat_model,
+                device=str(device),
+                model_dir=model_dir,
+            )
+
         if training_type in {"adversarial", "trades", "mart"}:
             return cls._load_robustbench_model(model_name, training_type, dataset, device)
 
@@ -141,6 +154,37 @@ class ModelFactory:
             )
 
         return cls._load_standard_vision_model(model_name, dataset, device, **kwargs)
+
+    @classmethod
+    def _load_robustbench_direct(
+        cls,
+        *,
+        rb_model_name: str,
+        dataset: str,
+        threat_model: str,
+        device: str,
+        model_dir: Optional[str],
+    ) -> nn.Module:
+        """
+        Load a RobustBench model by *RobustBench ID* (e.g., "Zhang2019Theoretically").
+
+        This avoids brittle hard-coded architecture->ID maps and makes it easy to
+        add modern defenses directly from RobustBench in evaluation configs.
+        """
+        try:
+            from robustbench.utils import load_model as rb_load_model
+        except ImportError as exc:
+            raise ImportError("RobustBench not installed. Install with: pip install robustbench") from exc
+
+        model = rb_load_model(
+            model_name=str(rb_model_name),
+            dataset=str(dataset),
+            threat_model=str(threat_model),
+            model_dir=model_dir,
+        )
+        model = model.to(device)
+        model.eval()
+        return model
 
     @classmethod
     def _load_robustbench_model(
@@ -231,13 +275,14 @@ class ModelFactory:
             checkpoint_path = cls._cache_dir / "ember_mlp.pt"
         
         checkpoint_path = Path(checkpoint_path)
-        if checkpoint_path.exists():
-            logger.info(f"[ModelFactory] Loading EMBER checkpoint: {checkpoint_path}")
-            state_dict = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(state_dict)
-        else:
-            logger.warning(f"[ModelFactory] EMBER checkpoint not found: {checkpoint_path}")
-            logger.warning("[ModelFactory] Using random initialization (results will be meaningless)")
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"EMBER checkpoint not found: {checkpoint_path}. "
+                "Train with: python scripts/train_ember_defense_models.py --train-standard"
+            )
+        logger.info(f"[ModelFactory] Loading EMBER checkpoint: {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
         
         model = model.to(device)
         model.eval()
@@ -272,18 +317,18 @@ class ModelFactory:
             checkpoint_path = cls._cache_dir / "nuscenes_resnet18.pt"
         
         checkpoint_path = Path(checkpoint_path)
-        if checkpoint_path.exists():
-            logger.info(f"[ModelFactory] Loading nuScenes checkpoint: {checkpoint_path}")
-            state_dict = torch.load(checkpoint_path, map_location=device)
-            
-            # Handle both raw state_dict and wrapped checkpoint formats
-            if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-                state_dict = state_dict['state_dict']
-            
-            model.load_state_dict(state_dict, strict=False)
-        else:
-            logger.warning(f"[ModelFactory] nuScenes checkpoint not found: {checkpoint_path}")
-            logger.warning("[ModelFactory] Using random initialization (results will be meaningless)")
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"nuScenes checkpoint not found: {checkpoint_path}. "
+                "See REPRODUCE.md for model setup instructions."
+            )
+        logger.info(f"[ModelFactory] Loading nuScenes checkpoint: {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        
+        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+        
+        model.load_state_dict(state_dict, strict=False)
         
         # ImageNet normalization (nuScenes images are similar)
         mean = (0.485, 0.456, 0.406)
@@ -332,17 +377,19 @@ class ModelFactory:
             checkpoint_path = cls._cache_dir / f"imagenet100_{architecture}.pt"
         
         checkpoint_path = Path(checkpoint_path)
-        if checkpoint_path.exists():
-            logger.info(f"[ModelFactory] Loading ImageNet-100 checkpoint: {checkpoint_path}")
-            state_dict = torch.load(checkpoint_path, map_location=device)
-            
-            if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-                state_dict = state_dict['state_dict']
-            
-            model.load_state_dict(state_dict, strict=False)
-        else:
-            logger.warning(f"[ModelFactory] ImageNet-100 checkpoint not found: {checkpoint_path}")
-            logger.warning("[ModelFactory] Using ImageNet-1K pretrained + random FC layer")
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"ImageNet-100 checkpoint not found: {checkpoint_path}. "
+                "Download from https://www.image-net.org/download.php and fine-tune, "
+                "or see REPRODUCE.md for model setup instructions."
+            )
+        logger.info(f"[ModelFactory] Loading ImageNet-100 checkpoint: {checkpoint_path}")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        
+        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+        
+        model.load_state_dict(state_dict, strict=False)
         
         # ImageNet normalization
         mean = (0.485, 0.456, 0.406)

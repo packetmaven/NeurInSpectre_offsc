@@ -8,6 +8,7 @@ with strict real-data validation enabled (including validity gates).
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Tuple
 
 import click
@@ -181,8 +182,7 @@ def run_table2_smoke(ctx: click.Context, **kwargs: Any) -> None:
     ember_root = data_root / "ember"
     ember_model = _pick_first_runnable_model([models_root / "ember_mlp_ts.pt"], dataset="ember")
     ember_has_data = _ember_ready(ember_root)
-    ember_has_dep = _module_available("ember")
-    if ember_model is not None and ember_has_data and ember_has_dep:
+    if ember_model is not None and ember_has_data:
         datasets["ember"] = {
             "path": _as_posix(ember_root),
             "split": "test",
@@ -202,10 +202,11 @@ def run_table2_smoke(ctx: click.Context, **kwargs: Any) -> None:
                 "dataset": "ember",
             }
         )
-    elif ember_has_data and not ember_has_dep:
+    elif ember_model is not None and not ember_has_data:
         click.echo(
-            "[table2-smoke] Skipping ember: optional dependency missing. "
-            "Install with: python -m pip install git+https://github.com/elastic/ember.git"
+            "[table2-smoke] Skipping ember: vectorized features missing under data_root. "
+            "Expected: data/ember/ember_2018/{X_test.dat,y_test.dat}. "
+            f"Generate via: {sys.executable} scripts/vectorize_ember_safe.py"
         )
 
     # nuScenes (optional; require label_map.json + mini split)
@@ -240,7 +241,7 @@ def run_table2_smoke(ctx: click.Context, **kwargs: Any) -> None:
     elif nuscenes_has_data and not nuscenes_has_dep:
         click.echo(
             "[table2-smoke] Skipping nuscenes: optional dependency missing. "
-            "Install with: python -m pip install nuscenes-devkit"
+            f"Install with: {sys.executable} -m pip install nuscenes-devkit"
         )
 
     if not datasets or not defenses or not models:

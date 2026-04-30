@@ -17,11 +17,14 @@ _CLICK_COMMANDS = {
     "attack",
     "analyze",
     "baselines",
+    "calibrate-thresholds",
     "characterize",
     "defense-analyzer",
     "doctor",
+    "drift-detect",
     "evaluate",
     "figures",
+    "mitre-atlas",
     "table2",
     "table2-smoke",
     "compare",
@@ -688,7 +691,11 @@ Examples:
     _activations_parser.add_argument('--interactive', action='store_true', help='Generate interactive Plotly HTML with Red/Blue team guidance')
     
     # Activation steganography command
-    steg_parser = subparsers.add_parser('activation_steganography', help='Activation steganography encode/extract')
+    steg_parser = subparsers.add_parser(
+        'activation_steganography',
+        aliases=['activation-steganography'],
+        help='Activation steganography encode/extract',
+    )
     steg_sub = steg_parser.add_subparsers(dest='steg_action', required=True)
     steg_enc = steg_sub.add_parser('encode', help='Encode payload bits into prompt/neurons')
     steg_enc.add_argument('--model', required=True)
@@ -701,6 +708,17 @@ Examples:
     steg_ext.add_argument('--activations', required=True, help='.npy/.npz path to activations [seq, hidden] (must exist; no synthetic fallback)')
     steg_ext.add_argument('--target-neurons', required=True)
     steg_ext.add_argument('--threshold', type=float, default=0.0)
+    steg_ext.add_argument(
+        '--ecc-decode',
+        action='store_true',
+        help='If set: interpret extracted bits as ECC code bits and decode (Hamming(7,4))',
+    )
+    steg_ext.add_argument(
+        '--ecc-pad-bits',
+        type=int,
+        default=0,
+        help='If --ecc-decode: pad bits used during encode (default: 0)',
+    )
     steg_ext.add_argument('--out-prefix', default='steg_')
 
     # Subnetwork hijack
@@ -768,7 +786,11 @@ Examples:
     gi_r.add_argument('--out-png', default=None, help='Output PNG path (default: <out-prefix>reconstruction_heatmap.png)')
 
     # Statistical evasion
-    se_parser = subparsers.add_parser('statistical_evasion', help='Generate/score statistical evasion datasets')
+    se_parser = subparsers.add_parser(
+        'statistical_evasion',
+        aliases=['statistical-evasion'],
+        help='Generate/score statistical evasion datasets',
+    )
     se_sub = se_parser.add_subparsers(dest='se_action', required=True)
     se_gen = se_sub.add_parser('generate', help='Generate benign/attack datasets')
     se_gen.add_argument('--samples', type=int, default=512)
@@ -1289,6 +1311,25 @@ Examples:
         help='Optional reference texts file (one line per reference embedding) for NN reconstruction',
     )
     ednn_p.add_argument('--embedding-dim', type=int, default=768)
+    ednn_p.add_argument(
+        '--dim-selection',
+        choices=['all', 'spectral', 'random', 'attention_only'],
+        default='all',
+        help='Embedding dimension selection mode (Tier 2 ablations)',
+    )
+    ednn_p.add_argument(
+        '--dim-top-frac',
+        type=float,
+        default=0.25,
+        help='Fraction of dims to allow updating (used when --dim-top-k is not set)',
+    )
+    ednn_p.add_argument(
+        '--dim-top-k',
+        type=int,
+        default=None,
+        help='Number of dims to allow updating (overrides --dim-top-frac)',
+    )
+    ednn_p.add_argument('--seed', type=int, default=0, help='Random seed (used for --dim-selection random)')
     ednn_p.add_argument('--target-query', help='For RAG poisoning')
     ednn_p.add_argument('--poisoned-document', help='For RAG poisoning: poisoned document content (string)')
     ednn_p.add_argument('--poisoned-document-file', help='For RAG poisoning: path to poisoned document (text file)')
@@ -3368,7 +3409,7 @@ Examples:
             except Exception as e:
                 logger.error(f"Activation drift evasion failed: {e}")
                 return 1
-        elif args.command == 'gradient_inversion':
+        elif args.command in {'gradient_inversion', 'gradient-inversion'}:
             try:
                 import numpy as np
                 import matplotlib.pyplot as plt
@@ -3404,6 +3445,45 @@ Examples:
                     Path(f"{args.out_prefix}reconstructed_meta.json").write_text(json.dumps(meta, indent=2))
                 # Compute per-step energy and robust, symmetric color limits
                 energy = np.linalg.norm(rec, axis=1)
+                # Draft mismatch closure: "spectral pre-screening" for inversion difficulty.
+                # We compute Layer-1 spectral features over the gradient-energy time series
+                # and export them as a standalone artifact for auditability.
+                screening_path = None
+                try:
+                    from ..characterization.layer1_spectral import compute_spectral_features as _compute_spec
+
+                    grad_energy = np.linalg.norm(G, axis=1).reshape(-1)
+                    spec = {}
+                    if grad_energy.size >= 2:
+                        spec = _compute_spec(grad_energy, fs=1.0, hf_ratio=0.25)
+
+                    # Heuristic prescreen: high entropy indicates noisy gradients.
+                    ent = float((spec or {}).get("spectral_entropy_norm", 0.0) or 0.0)
+                    hf = float((spec or {}).get("high_freq_ratio", 0.0) or 0.0)
+                    prescreen = {
+                        "passed": bool(ent <= 0.95),
+                        "thresholds": {"spectral_entropy_norm_max": 0.95},
+                        "observed": {"spectral_entropy_norm": ent, "high_freq_ratio": hf},
+                    }
+                    screening_path = Path(f"{args.out_prefix}screening.json")
+                    screening_path.parent.mkdir(parents=True, exist_ok=True)
+                    screening_path.write_text(
+                        json.dumps(
+                            {
+                                "spectral": spec,
+                                "prescreen": prescreen,
+                                "gradient_energy": {
+                                    "mean": float(np.mean(grad_energy)) if grad_energy.size else 0.0,
+                                    "std": float(np.std(grad_energy)) if grad_energy.size else 0.0,
+                                    "samples": int(grad_energy.size),
+                                },
+                            },
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    screening_path = None
                 mu, sd = float(np.mean(energy)), float(np.std(energy) + 1e-8)
                 guard = mu + 2.0 * sd
                 p5, p95 = np.percentile(rec, 5.0), np.percentile(rec, 95.0)
@@ -3575,11 +3655,13 @@ Examples:
                 print(f"{args.out_prefix}reconstructed.npy")
                 print(fhm)
                 print(fhtml)
+                if screening_path is not None:
+                    print(str(screening_path))
                 return 0
             except Exception as e:
                 logger.error(f"Gradient inversion failed: {e}")
                 return 1
-        elif args.command == 'statistical_evasion':
+        elif args.command in {'statistical_evasion', 'statistical-evasion'}:
             try:
                 import numpy as np, json
                 from pathlib import Path
@@ -9101,12 +9183,12 @@ Examples:
         elif args.command == 'recommend-countermeasures':
             from .attack_vector_analysis import run_recommend_countermeasures
             return run_recommend_countermeasures(args)
-        elif args.command == 'activation_steganography':
+        elif args.command in {'activation_steganography', 'activation-steganography'}:
             try:
                 import json
                 import numpy as np
                 from pathlib import Path
-                from ..activation_steganography import ActivationSteganography as _MaybeECC
+                from ..activation_steganography import ActivationSteganography as _MaybeECC, ECC_AVAILABLE as _ECC_AVAILABLE
 
                 if args.steg_action == 'encode':
                     # Parse payload bits and neurons
@@ -9120,11 +9202,17 @@ Examples:
                     if len(bits) == 0 or len(neurons) == 0:
                         bits = []
                         neurons = []
-                    # Try ECC-based encode if available; else marker-based
+                    # ECC-based encode if available; else marker fallback.
+                    method = 'ecc' if bool(_ECC_AVAILABLE) else 'marker'
+                    ecc_meta = None
                     try:
                         encoder = _MaybeECC()
-                        encoded_prompt = encoder.encode_payload(args.prompt, bits, neurons)
-                        method = 'ecc'
+                        if bool(_ECC_AVAILABLE) and hasattr(encoder, 'encode_payload_result'):
+                            res = encoder.encode_payload_result(args.prompt, bits, neurons)
+                            encoded_prompt = str(getattr(res, 'encoded_prompt', ''))
+                            ecc_meta = getattr(res, 'to_dict', lambda: None)()
+                        else:
+                            encoded_prompt = encoder.encode_payload(args.prompt, bits, neurons)
                     except Exception:
                         marker = ','.join(map(str, bits)) if bits else ''
                         encoded_prompt = f"{args.prompt} [STEG:{marker}]" if marker else args.prompt
@@ -9140,6 +9228,8 @@ Examples:
                         'tokenizer': args.tokenizer,
                         'prompt_len': len(args.prompt),
                     }
+                    if ecc_meta:
+                        meta['ecc'] = ecc_meta
                     Path(f"{args.out_prefix}steg_metadata.json").write_text(json.dumps(meta, indent=2))
                     print(str(outp))
                     print(f"{args.out_prefix}steg_metadata.json")
@@ -9192,9 +9282,20 @@ Examples:
                             bits.append(0)
                         else:
                             bits.append(1 if last[n] >= thr else 0)
+                    out_payload = {'target_neurons': neurons, 'threshold': thr, 'bits': bits}
+                    if bool(getattr(args, 'ecc_decode', False)):
+                        try:
+                            from ..ecc_activation_steganography import hamming74_decode as _h74_decode
+                            pad_bits = int(getattr(args, 'ecc_pad_bits', 0) or 0)
+                            ecc_out = _h74_decode(bits, pad_bits=pad_bits)
+                            out_payload['ecc'] = ecc_out
+                            out_payload['decoded_bits'] = list(ecc_out.get('decoded_bits') or [])
+                        except Exception as exc:
+                            out_payload['ecc'] = {'error': str(exc)}
+                            out_payload['decoded_bits'] = []
                     # Save
                     outj = Path(f"{args.out_prefix}steg_extract.json")
-                    outj.write_text(json.dumps({'target_neurons': neurons, 'threshold': thr, 'bits': bits}, indent=2))
+                    outj.write_text(json.dumps(out_payload, indent=2))
                     # Visualization: bar plot of target neuron activations vs threshold with Red/Blue keys
                     try:
                         import matplotlib.pyplot as _plt

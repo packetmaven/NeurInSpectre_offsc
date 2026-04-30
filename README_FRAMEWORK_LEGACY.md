@@ -22,7 +22,7 @@
 
 NeurInSpectre rejects the black-box paradigm. By instrumenting model internals—weight matrices, spectral eigenvalues, attention heads, and activation flows—we expose the exact computational mechanisms that drive model decisions. Red Teams gain the ability to systematically identify and exploit model vulnerabilities through white-box analysis. Blue Teams gain the visibility needed to detect adversarial activation patterns and harden against mechanistic attack surfaces. This is security through transparency.
 
-**Deep dive blog post:** [Breaking Gradient Obfuscation: A Red Team's Guide to NeurInSpectre's Mathematical Arsenal](https://packetmaven-blog.web.app/posts/02_the-volterra-vendetta/)
+**Deep dive:** (redacted for double-blind submission)
 
 <a id="the-problem"></a>
 
@@ -270,7 +270,7 @@ Built for red teams, blue teams, and security researchers, it integrates cutting
 ### Prerequisites
 - **Python**: 3.10+ (3.10.x recommended)
 - **OS**: macOS 11+ (Apple Silicon) / Ubuntu 20.04+ / Windows 10+ (WSL2)
-- **Hardware**: 16GB+ RAM, GPU recommended (Apple Silicon MPS or NVIDIA CUDA)
+- **Hardware**: 32GB+ RAM for full evaluation (16GB for smoke tests), GPU recommended (Apple Silicon MPS or NVIDIA CUDA)
 
 <a id="installation"></a>
 
@@ -278,9 +278,9 @@ Built for red teams, blue teams, and security researchers, it integrates cutting
 
 #### **Option 1: Quick Install (Recommended)**
 ```bash
-# Clone the repository
-git clone https://github.com/packetmaven/NeurInSpectre_branch2.git
-cd NeurInSpectre
+# Double-blind friendly: start from the provided artifact archive
+tar -xzf <artifact>.tar.gz
+cd <artifact_root>
 
 # Create virtual environment
 python3 -m venv .venv-neurinspectre
@@ -289,8 +289,8 @@ source .venv-neurinspectre/bin/activate
 # Install PyTorch (required for Apple Silicon)
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cpu
 
-# Install NeurInSpectre with all dependencies
-pip install -e .
+# Install NeurInSpectre
+pip install -e ".[dev]"
 
 # Optional: AutoAttack (for APGD parity tests)
 python -m pip install git+https://github.com/fra31/auto-attack
@@ -310,10 +310,10 @@ neurinspectre --help
 ### Installation
 
 ```bash
-# Install from source
-git clone https://github.com/packetmaven/Neurinspectre
-cd Neurinspectre
-pip install -e .
+# Double-blind friendly: start from the provided artifact archive
+tar -xzf <artifact>.tar.gz
+cd <artifact_root>
+pip install -e ".[dev]"
 
 # Verify installation
 neurinspectre --version
@@ -8603,7 +8603,7 @@ Based on **SoK: Comprehensive Causality Analysis Framework** (Dec 2025):
 
 **Questions? Issues? Contributions?**
 
-Open an issue at: https://github.com/packetmaven/NeurInSpectre_branch2/issues
+Open an issue at: https://artifact.invalid/issues
 
 
 ---

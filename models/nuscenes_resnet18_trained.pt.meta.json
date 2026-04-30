@@ -1,0 +1,25 @@
+{
+  "dataset": "nuscenes",
+  "sha256": "aef9453094ab43c6a7f04483051d96c152c0871a814f0dbedc9713f4993a1241",
+  "version": "v1.0-mini",
+  "root": "data/nuscenes",
+  "labels_path": "data/nuscenes/label_map.json",
+  "labels_sha256": "85ec400261cf4abedf8da1e8d22db6d6a388a776570bf16523d3cc1b8cf0a772",
+  "num_classes": 10,
+  "train_split": "train",
+  "val_split": "val",
+  "pretrained_backbone": true,
+  "finetune_backbone": false,
+  "class_balanced": true,
+  "seed": 42,
+  "metrics": {
+    "train_acc": 0.6470588235294118,
+    "val_acc": 0.6375,
+    "train_samples": 323.0,
+    "val_samples": 80.0
+  },
+  "torch_version": "2.10.0",
+  "elapsed_seconds": 9.520084142684937,
+  "torchscript_path": "models/nuscenes_resnet18_trained.pt",
+  "state_dict_path": "models/checkpoints/nuscenes_resnet18_state_dict.pt"
+}

@@ -28,7 +28,7 @@ from ..defenses.factory import DefenseFactory
 from ..evaluation.datasets import DatasetFactory
 from ..models.factory import ModelFactory
 from ..models.loader import load_model as load_rb_model
-from ..evaluation.metrics import compute_perturbation_metrics
+from ..evaluation.metrics import compute_perturbation_metrics, compute_query_efficiency
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +313,25 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
     return data
 
 
+def load_threshold_overrides(path: str | Path) -> Dict[str, Any]:
+    """
+    Load DefenseAnalyzer threshold overrides from JSON.
+
+    Accepts either:
+    - a direct overrides mapping, e.g. {"ETD_THRESHOLD_SEVERE": 0.65}
+    - a full calibrate-thresholds payload containing "defense_analyzer_threshold_overrides"
+    """
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as handle:
+        obj: Any = json.load(handle)
+    if isinstance(obj, dict) and isinstance(obj.get("defense_analyzer_threshold_overrides"), dict):
+        obj = obj["defense_analyzer_threshold_overrides"]
+    if not isinstance(obj, dict):
+        raise ValueError(f"Threshold overrides JSON must be an object/dict: {path}")
+    # Defensive copy: callers may mutate.
+    return dict(obj)
+
+
 def save_json(payload: Dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,6 +386,10 @@ def _load_model_from_dict(
         domain = cfg.get("domain", "vision")
         training_type = cfg.get("training_type", "standard")
         model_kwargs = dict(cfg.get("model_kwargs") or {})
+        # Pass through common RobustBench args if provided at top-level.
+        for extra_key in ("threat_model", "model_dir"):
+            if extra_key in cfg and extra_key not in model_kwargs:
+                model_kwargs[extra_key] = cfg[extra_key]
         if cfg.get("model_factory"):
             return load_rb_model(
                 model_name=model_name,
@@ -589,6 +612,9 @@ def load_dataset(
         }
         if data_path:
             kwargs["root"] = data_path
+        # Only CIFAR-10 supports implicit download via torchvision.
+        if name == "cifar10":
+            kwargs["download"] = bool(download)
         return DatasetFactory.get_dataset(name, **kwargs)
     if name == "nuscenes":
         kwargs = {
@@ -808,6 +834,7 @@ def build_defense(
         "random_padcrop": "random_pad_crop",
         "random_noise": "random_noise",
         "rl_obfuscation": "rl_obfuscation",
+        "tent": "tent",
         "total_variation": "total_variation",
     }
     if key == "custom":
@@ -879,6 +906,8 @@ def evaluate_attack_runner(
     perturbation_count = 0
     query_counts = []
     iteration_counts = []
+    per_sample_queries: list[int] = []
+    per_sample_success: list[bool] = []
     batch_index = 0
 
     save_path = Path(save_dir) if save_dir else None
@@ -951,6 +980,25 @@ def evaluate_attack_runner(
         success_total += int(success.sum().item())
         adv_correct += int((preds_adv == y_attack).sum().item())
 
+        # Query accounting (Tier 3 evidence): SquareAttack and other query-based
+        # runners may expose per-sample counts via AttackResult.metadata["queries_used"].
+        meta = getattr(result, "metadata", None)
+        if isinstance(meta, dict) and meta.get("queries_used") is not None:
+            q = meta.get("queries_used")
+            try:
+                if isinstance(q, np.ndarray):
+                    q_list = q.reshape(-1).tolist()
+                elif isinstance(q, (list, tuple)):
+                    q_list = list(q)
+                else:
+                    q_list = [q]
+                if len(q_list) == int(x_attack.size(0)):
+                    per_sample_queries.extend(int(float(v)) for v in q_list)
+                    per_sample_success.extend([bool(v) for v in success.detach().cpu().tolist()])
+            except Exception:
+                # Best-effort: query accounting is optional and should not fail evaluation.
+                pass
+
         pert_metrics = compute_perturbation_metrics(x_attack, x_adv, norm=norm)
         if pert_metrics:
             for k, v in pert_metrics.items():
@@ -987,6 +1035,11 @@ def evaluate_attack_runner(
     clean_accuracy = clean_correct / total if total > 0 else 0.0
     robust_accuracy = adv_correct / total if total > 0 else 0.0
     attack_success_rate = success_total / clean_correct if clean_correct > 0 else 0.0
+    # Some papers/reporting pipelines define "ASR" over *all* samples (not only the
+    # clean-correct subset). We export both to make the definition audit-able.
+    attack_success_rate_overall = success_total / total if total > 0 else 0.0
+    # Overall misclassification rate after attack (includes samples already wrong at clean time).
+    compromise_rate = 1.0 - float(robust_accuracy)
 
     perturbation_summary = {}
     if perturbation_count > 0:
@@ -995,7 +1048,16 @@ def evaluate_attack_runner(
     query_summary = {}
     queries_mean = None
     iterations_mean = None
-    if query_counts:
+    if per_sample_queries and len(per_sample_queries) == len(per_sample_success):
+        try:
+            eff = compute_query_efficiency(per_sample_queries, torch.tensor(per_sample_success, dtype=torch.bool))
+            query_summary = dict(eff)
+            if "mean_queries" in eff:
+                queries_mean = float(eff["mean_queries"])
+        except Exception:
+            pass
+    elif query_counts:
+        # Fallback: some runners only expose scalar query counts per batch.
         query_arr = np.array(query_counts, dtype=float)
         queries_mean = float(query_arr.mean())
         query_summary = {
@@ -1011,9 +1073,13 @@ def evaluate_attack_runner(
     return {
         "clean_accuracy": float(clean_accuracy),
         "robust_accuracy": float(robust_accuracy),
+        "compromise_rate": float(compromise_rate),
         "attack_success_rate": float(attack_success_rate),
+        "attack_success_rate_conditional": float(attack_success_rate),
+        "attack_success_rate_overall": float(attack_success_rate_overall),
         "samples": int(total),
         "correct_samples": int(clean_correct),
+        "success_samples": int(success_total),
         "num_classes": int(num_classes or 0),
         "perturbation": perturbation_summary,
         "query_efficiency": query_summary,

@@ -1,0 +1,26 @@
+{
+  "dataset": "ember",
+  "checkpoint_tag": "md_distillation_ember",
+  "variant": "defensive_distillation",
+  "input_dim": 2381,
+  "num_classes": 2,
+  "seed": 42,
+  "device": "mps",
+  "train_samples": 100000,
+  "val_samples": 20000,
+  "lr": 0.001,
+  "epochs": 2,
+  "temperature": 100.0,
+  "alpha_hard": 0.0,
+  "val_acc": 0.54645,
+  "train_stats": {
+    "epochs": 2.0,
+    "last_loss": 0.0726357102394104
+  },
+  "sha256": "7f4d4bf832d3dbbb1d33a06c8cad484076f372045370a8e1e1f300086f4e9411",
+  "torch_version": "2.10.0",
+  "elapsed_seconds": 31.429126739501953,
+  "torchscript_path": "models/md_distillation_ember_ts.pt",
+  "state_dict_path": "models/checkpoints/md_distillation_ember.pt",
+  "teacher_state_dict_path": "models/checkpoints/ember_mlp.pt"
+}

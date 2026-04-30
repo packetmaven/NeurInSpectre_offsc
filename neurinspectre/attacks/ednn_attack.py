@@ -35,7 +35,7 @@ MITRE ATLAS Mapping:
 - AML.T0043: Craft Adversarial Data
 - AML.T0024.002: Extract AI Model
 
-Author: packetmaven
+Author: NeurInSpectre Security Team
 License: GPL-3.0
 """
 
@@ -89,6 +89,16 @@ class EDNNConfig:
     rag_poison_ratio: float = 0.1  # Target top-fraction when evaluating rank vs a vector DB
     rag_poison_similarity_threshold: float = 0.8  # Success threshold when no vector DB is provided
     rag_poison_early_stop_similarity: float = 0.85  # Early-stop similarity target
+
+    # Tier 2 ablations: embedding dimension selection
+    # - all: update all dims (legacy behavior)
+    # - spectral: select high spectral-entropy dims from reference_embeddings
+    # - random: random subset (seeded)
+    # - attention_only: reference-variance subset (proxy when attention weights are unavailable)
+    dim_selection: str = "all"  # all|spectral|random|attention_only
+    dim_top_frac: float = 0.25
+    dim_top_k: Optional[int] = None
+    dim_selection_seed: int = 0
     
     # Thresholds
     element_wise_threshold: float = 0.05
@@ -305,6 +315,113 @@ class EDNNAttack:
         self.knn.fit(ref_emb_np)
         
         logger.info(f"✅ K-NN initialized with {len(self.reference_embeddings)} reference embeddings")
+
+    def _get_dim_mask(self, dim: int) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Return a float mask in {0,1} for embedding dimension updates.
+
+        This is used for Tier 2 ablations (spectral|random|attention_only) to
+        restrict perturbations to a subset of embedding dimensions.
+        """
+        mode = str(getattr(self.config, "dim_selection", "all") or "all").strip().lower().replace("-", "_")
+        frac = float(getattr(self.config, "dim_top_frac", 0.25))
+        top_k = getattr(self.config, "dim_top_k", None)
+        seed = int(getattr(self.config, "dim_selection_seed", 0))
+
+        D = int(dim)
+        if D <= 0:
+            return torch.zeros((0,), device=self.device, dtype=torch.float32), {"mode": mode, "k": 0}
+
+        if top_k is not None:
+            try:
+                k = int(top_k)
+            except Exception:
+                k = int(round(float(frac) * float(D)))
+        else:
+            k = int(round(float(frac) * float(D)))
+        k = max(1, min(D, int(k)))
+
+        if mode in {"all", "none", "full"}:
+            mask = torch.ones((D,), device=self.device, dtype=torch.float32)
+            return mask, {"mode": "all", "k": D, "frac": 1.0}
+
+        ref = self.reference_embeddings
+        ref_np: Optional[np.ndarray] = None
+        if ref is not None:
+            try:
+                ref_np = ref.detach().cpu().numpy().astype(np.float64, copy=False)
+            except Exception:
+                ref_np = None
+
+        indices: np.ndarray
+        scores: Optional[np.ndarray] = None
+
+        if mode == "random":
+            rng = np.random.default_rng(int(seed))
+            indices = rng.choice(D, size=k, replace=False)
+            indices = np.asarray(indices, dtype=int)
+        elif mode == "spectral":
+            if ref_np is None or ref_np.ndim != 2 or ref_np.shape[0] < 8:
+                logger.warning("EDNN dim_selection=spectral requested but reference_embeddings are unavailable/too small; falling back to all.")
+                mask = torch.ones((D,), device=self.device, dtype=torch.float32)
+                return mask, {"mode": "all", "k": D, "frac": 1.0, "fallback": "missing_reference_embeddings"}
+            # Vectorized spectral entropy per dimension over the reference set.
+            n, d_ref = int(ref_np.shape[0]), int(ref_np.shape[1])
+            d_use = min(D, d_ref)
+            sig = ref_np[:n, :d_use]
+            sig = sig - np.mean(sig, axis=0, keepdims=True)
+            fft = np.fft.rfft(sig, axis=0)
+            power = (fft.real * fft.real) + (fft.imag * fft.imag)
+            denom = np.sum(power, axis=0, keepdims=True) + 1e-12
+            p = power / denom
+            H = -np.sum(p * np.log(p + 1e-12), axis=0)
+            H = H / (np.log(float(power.shape[0]) + 1e-12) if power.shape[0] > 1 else 1.0)
+            scores = H
+            top = np.argsort(scores)[::-1][:k]
+            indices = np.asarray(top, dtype=int)
+        elif mode == "attention_only":
+            if ref_np is None or ref_np.ndim != 2:
+                logger.warning("EDNN dim_selection=attention_only requested but reference_embeddings are unavailable; falling back to all.")
+                mask = torch.ones((D,), device=self.device, dtype=torch.float32)
+                return mask, {"mode": "all", "k": D, "frac": 1.0, "fallback": "missing_reference_embeddings"}
+            n, d_ref = int(ref_np.shape[0]), int(ref_np.shape[1])
+            d_use = min(D, d_ref)
+            sig = ref_np[:n, :d_use]
+            scores = np.var(sig, axis=0)
+            top = np.argsort(scores)[::-1][:k]
+            indices = np.asarray(top, dtype=int)
+        else:
+            logger.warning("Unknown EDNN dim_selection=%r; using all dims.", mode)
+            mask = torch.ones((D,), device=self.device, dtype=torch.float32)
+            return mask, {"mode": "all", "k": D, "frac": 1.0, "fallback": "unknown_mode"}
+
+        indices = np.unique(indices.astype(int))
+        indices = indices[(indices >= 0) & (indices < D)]
+        if indices.size == 0:
+            mask = torch.ones((D,), device=self.device, dtype=torch.float32)
+            return mask, {"mode": "all", "k": D, "frac": 1.0, "fallback": "empty_selection"}
+
+        mask = torch.zeros((D,), device=self.device, dtype=torch.float32)
+        mask[torch.tensor(indices.tolist(), device=self.device, dtype=torch.long)] = 1.0
+
+        info: Dict[str, Any] = {
+            "mode": mode,
+            "k": int(indices.size),
+            "requested_k": int(k),
+            "frac": float(frac),
+            "seed": int(seed),
+            "indices_preview": [int(i) for i in indices[:20].tolist()],
+        }
+        if scores is not None:
+            try:
+                info["score_summary"] = {
+                    "min": float(np.min(scores)),
+                    "max": float(np.max(scores)),
+                    "mean": float(np.mean(scores)),
+                }
+            except Exception:
+                pass
+        return mask, info
     
     # ============================================================================
     # ATTACK 1: EMBEDDING INVERSION (ALGEN-INSPIRED)
@@ -568,10 +685,34 @@ class EDNNAttack:
             )
         
         # Steganographic injection (linear blend in embedding space).
+        mask_f, dim_info = self._get_dim_mask(int(clean_embedding.numel()))
+        mask_bool = (mask_f > 0.5)
+
         alpha = float(self.config.steganographic_alpha)
         clean_unit = F.normalize(clean_embedding, p=2, dim=0)
         payload_unit = F.normalize(malicious_embedding, p=2, dim=0)
-        stego_embedding = F.normalize(clean_unit + alpha * payload_unit, p=2, dim=0)
+
+        # Tier 2 ablation: only allow updates on the selected dimensions.
+        if not bool(mask_bool.any()):
+            stego_embedding = clean_unit
+        elif int(mask_bool.sum().item()) == int(clean_unit.numel()):
+            stego_embedding = F.normalize(clean_unit + alpha * payload_unit, p=2, dim=0)
+        else:
+            fixed = ~mask_bool
+            fixed_norm2 = torch.sum(clean_unit[fixed] ** 2)
+            fixed_norm2 = torch.clamp(fixed_norm2, min=0.0, max=1.0)
+
+            u_raw = clean_unit[mask_bool] + alpha * payload_unit[mask_bool]
+            u_norm = torch.norm(u_raw)
+            if float(u_norm.item()) < 1e-12:
+                u_raw = clean_unit[mask_bool]
+                u_norm = torch.norm(u_raw) + 1e-12
+            u_dir = u_raw / (u_norm + 1e-12)
+            u_scale = torch.sqrt(torch.clamp(1.0 - fixed_norm2, min=0.0))
+            u = u_dir * u_scale
+
+            stego_embedding = clean_unit.clone()
+            stego_embedding[mask_bool] = u
         
         # Calculate imperceptibility metrics
         l2_dist = float(torch.norm(stego_embedding - clean_unit).item())
@@ -611,6 +752,7 @@ class EDNNAttack:
                 'malicious_prompt': malicious_prompt,
                 'stealth_score': stealth_score,
                 'payload_similarity': payload_cos,
+                'dim_selection': dim_info,
             }
         )
         
@@ -666,6 +808,9 @@ class EDNNAttack:
         
         source_embedding = source_embedding.to(self.device)
         target_embedding = target_embedding.to(self.device)
+
+        mask_f, dim_info = self._get_dim_mask(int(source_embedding.numel()))
+        mask_f = mask_f.to(source_embedding.device)
         
         # Initialize adversarial embedding
         adv_embedding = source_embedding.clone().requires_grad_(True)
@@ -688,18 +833,20 @@ class EDNNAttack:
             alignment_loss = 1.0 - similarity  # Maximize similarity
             
             # Perturbation regularization
-            perturbation = adv_embedding - source_embedding
+            perturbation = (adv_embedding - source_embedding) * mask_f
             perturbation_loss = torch.norm(perturbation)
             
             # Total loss
             total_loss = alignment_loss + 0.1 * perturbation_loss
             
             total_loss.backward()
+            if adv_embedding.grad is not None:
+                adv_embedding.grad.mul_(mask_f)
             optimizer.step()
             
             # Project to epsilon ball
             with torch.no_grad():
-                perturbation = adv_embedding - source_embedding
+                perturbation = (adv_embedding - source_embedding) * mask_f
                 perturbation_norm = torch.norm(perturbation)
                 if perturbation_norm > self.config.epsilon:
                     perturbation = perturbation / perturbation_norm * self.config.epsilon
@@ -749,7 +896,8 @@ class EDNNAttack:
             metadata={
                 'source_modality': source_modality,
                 'target_modality': target_modality,
-                'method': 'Gradient-based alignment optimization'
+                'method': 'Gradient-based alignment optimization',
+                'dim_selection': dim_info,
             }
         )
         
@@ -896,6 +1044,9 @@ class EDNNAttack:
             return self._create_failed_result("rag_poison", np.asarray([], dtype=float), error=str(e))
         
         # Optimize poisoned embedding to rank highly for query
+        mask_f, dim_info = self._get_dim_mask(int(poison_embedding.numel()))
+        mask_f = mask_f.to(poison_embedding.device)
+
         optimized_poison = poison_embedding.clone().requires_grad_(True)
         optimizer = torch.optim.Adam([optimized_poison], lr=0.05)  # Higher LR for faster convergence
         
@@ -912,13 +1063,23 @@ class EDNNAttack:
             )
             
             # Minimize distance from original (maintain semantic coherence)
-            coherence_loss = torch.norm(optimized_poison - poison_embedding)
+            coherence_loss = torch.norm((optimized_poison - poison_embedding) * mask_f)
             
             # Total loss (reduced coherence weight for stronger attack)
             loss = -similarity + 0.05 * coherence_loss
             
             loss.backward()
+            if optimized_poison.grad is not None:
+                optimized_poison.grad.mul_(mask_f)
             optimizer.step()
+
+            # Project to epsilon ball on the selected dimensions (ablation parity).
+            with torch.no_grad():
+                pert = (optimized_poison - poison_embedding) * mask_f
+                pert_norm = torch.norm(pert)
+                if pert_norm > self.config.epsilon:
+                    pert = pert / pert_norm * self.config.epsilon
+                optimized_poison.data = poison_embedding + pert
             
             if iteration % 50 == 0 and self.config.verbose:
                 logger.info(f"   Iter {iteration}: Similarity={similarity.item():.4f}")
@@ -994,6 +1155,7 @@ class EDNNAttack:
                 'target_top_k': target_top_k,
                 'top_fraction': float(getattr(self.config, "rag_poison_ratio", 0.1)),
                 'similarity_threshold': similarity_threshold,
+                'dim_selection': dim_info,
             }
         )
         

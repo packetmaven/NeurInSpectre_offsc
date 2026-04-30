@@ -232,7 +232,15 @@ class BaseAdversarialAttack(ABC):
             raise ValueError(
                 f"Batch size mismatch: x has {x.shape[0]} samples, target_labels has {target_labels.shape[0]} labels"
             )
-        if x.device != torch.device(self.device):
+        expected = torch.device(self.device)
+        # On some backends (notably MPS) tensors may report as "mps:0" while
+        # `torch.device("mps")` stringifies as "mps". Compare by device type first.
+        mismatched = x.device.type != expected.type
+        # Preserve index mismatch warnings for CUDA where it matters.
+        if not mismatched and expected.type == "cuda":
+            if expected.index is not None and x.device.index is not None and expected.index != x.device.index:
+                mismatched = True
+        if mismatched:
             logger.warning(
                 "Input device %s doesn't match attack device %s. Moving to %s.",
                 x.device,
@@ -261,19 +269,41 @@ class GradientBasedAttack(BaseAdversarialAttack):
         self._range_detected = False
 
     def _detect_and_set_range(self, x: torch.Tensor) -> None:
-        if self._range_detected:
+        """
+        Detect (or update) the clamp range used during projection.
+
+        Important: this method must be safe across *multiple batches*.
+        Some datasets (notably EMBER) contain rare but very large feature values.
+        If we only infer the range once (from the first batch), later batches can
+        contain values outside that range and the projection step will silently
+        clamp `x_adv`, producing enormous (and budget-violating) perturbations.
+        """
+        if not bool(self.config.auto_detect_range):
+            if not self._range_detected:
+                self._input_min, self._input_max = self.config.input_range
+                logger.info(
+                    "Using configured input range: [%.3f, %.3f]", self._input_min, self._input_max
+                )
+                self._range_detected = True
             return
-        if self.config.auto_detect_range:
-            self._input_min, self._input_max = self.config.detect_input_range(x)
+
+        detected_min, detected_max = self.config.detect_input_range(x)
+        if (not self._range_detected) or (self._input_min is None) or (self._input_max is None):
+            self._input_min, self._input_max = float(detected_min), float(detected_max)
             logger.info(
                 "Auto-detected input range: [%.3f, %.3f]", self._input_min, self._input_max
             )
-        else:
-            self._input_min, self._input_max = self.config.input_range
-            logger.info(
-                "Using configured input range: [%.3f, %.3f]", self._input_min, self._input_max
+            self._range_detected = True
+            return
+
+        # Never shrink the range; only expand to include new extrema.
+        new_min = min(float(self._input_min), float(detected_min))
+        new_max = max(float(self._input_max), float(detected_max))
+        if new_min != float(self._input_min) or new_max != float(self._input_max):
+            self._input_min, self._input_max = new_min, new_max
+            logger.debug(
+                "Expanded input range to: [%.3f, %.3f]", self._input_min, self._input_max
             )
-        self._range_detected = True
 
     def _get_loss_type(self) -> str:
         loss = getattr(self.config, "loss", "dlr")
@@ -375,8 +405,8 @@ class GradientBasedAttack(BaseAdversarialAttack):
         return grad
 
     def _project(self, x: torch.Tensor, x_adv: torch.Tensor, epsilon: Optional[float] = None) -> torch.Tensor:
-        if not self._range_detected:
-            self._detect_and_set_range(x)
+        # Ensure the clamp range includes this batch's extrema (see docstring).
+        self._detect_and_set_range(x)
         eps = float(epsilon if epsilon is not None else self.config.epsilon)
         norm = str(self.config.norm).lower()
         if norm in {"linf", "l_inf", "inf"}:
@@ -419,8 +449,7 @@ class GradientBasedAttack(BaseAdversarialAttack):
         """
         Uniform random initialization in L2 ball.
         """
-        if not self._range_detected:
-            self._detect_and_set_range(x)
+        self._detect_and_set_range(x)
         eps = float(epsilon)
         delta = torch.randn_like(x)
         delta_flat = delta.view(x.size(0), -1)

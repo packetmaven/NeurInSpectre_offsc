@@ -15,6 +15,38 @@ from .fab import FABEnsemble
 from .square import SquareAttack
 
 
+def _project_lp(
+    x0: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    eps: float,
+    norm: str,
+    clip_min: float,
+    clip_max: float,
+) -> torch.Tensor:
+    """
+    Project `x` into an Lp ball of radius `eps` around `x0`, then clamp to
+    `[clip_min, clip_max]`.
+
+    This is intentionally implemented here (rather than relying on individual
+    sub-attacks) so the "AutoAttack" wrapper never reports unconstrained ASR.
+    """
+    norm_key = str(norm).lower().replace("_", "")
+    eps_f = float(eps)
+    if norm_key in {"linf", "inf", "l∞"}:
+        delta = torch.clamp(x - x0, -eps_f, eps_f)
+        out = x0 + delta
+    elif norm_key in {"l2", "2"}:
+        delta = x - x0
+        flat = delta.view(delta.size(0), -1)
+        norms = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+        factors = torch.minimum(torch.ones_like(norms), torch.full_like(norms, eps_f) / norms)
+        out = x0 + (flat * factors).view_as(delta)
+    else:
+        raise ValueError(f"Unsupported norm for AutoAttack projection: {norm!r}")
+    return torch.clamp(out, min=float(clip_min), max=float(clip_max))
+
+
 class AutoAttackEnsemble:
     """
     Simple AutoAttack-style ensemble that applies a list of attacks sequentially.
@@ -171,6 +203,9 @@ class AutoAttack:
         x = x.to(self.device)
         y = y.to(self.device)
         batch_size = x.size(0)
+        x0 = x.detach().clone()
+        clip_min = float(x0.min().item())
+        clip_max = float(x0.max().item())
 
         attacks = self.attacks
         if x.ndim != 4:
@@ -200,14 +235,48 @@ class AutoAttack:
                 samples_per_attack[attack_name] = 0
                 continue
 
-            x_remaining = x_adv[remaining_mask]
+            # Always constrain around the *original* clean inputs.
+            x0_remaining = x0[remaining_mask]
+            x_remaining = x0_remaining
             y_remaining = y[remaining_mask]
 
-            if attack_name == "square":
-                x_attacked, _stats = attack(x_remaining, y_remaining, verbose=False)
-            else:
-                adv_out = attack(x_remaining, y_remaining)
-                x_attacked = adv_out[0] if isinstance(adv_out, (tuple, list)) else adv_out
+            try:
+                if attack_name == "square":
+                    x_attacked, _stats = attack(x_remaining, y_remaining, verbose=False)
+                else:
+                    adv_out = attack(x_remaining, y_remaining)
+                    x_attacked = adv_out[0] if isinstance(adv_out, (tuple, list)) else adv_out
+            except RuntimeError as exc:
+                # Some defenses (e.g., hard-vote ensembles) are non-differentiable and can
+                # break gradient-based sub-attacks like FAB/APGD. AutoAttack should keep
+                # running remaining sub-attacks instead of aborting the full evaluation.
+                msg = str(exc).lower()
+                grad_missing = (
+                    "does not require grad" in msg
+                    or "does not have a grad_fn" in msg
+                    or "element 0 of tensors" in msg
+                )
+                if grad_missing:
+                    if verbose:
+                        print(
+                            f"  [AutoAttack] Skipping {attack_name}: gradient unavailable "
+                            f"for this defense ({type(exc).__name__}: {exc})"
+                        )
+                    asr_per_attack[attack_name] = 0.0
+                    samples_per_attack[attack_name] = 0
+                    continue
+                raise
+
+            # Enforce the threat-model constraint in the wrapper (even if a sub-attack
+            # drifts outside the allowed budget).
+            x_attacked = _project_lp(
+                x0_remaining,
+                x_attacked,
+                eps=self.eps,
+                norm=self.norm,
+                clip_min=clip_min,
+                clip_max=clip_max,
+            )
 
             with torch.no_grad():
                 preds = self.model(x_attacked).argmax(1)

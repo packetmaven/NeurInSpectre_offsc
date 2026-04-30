@@ -619,7 +619,25 @@ class _NeurInSpectreRunner(_BaseRunner):
         eval_model = defense or model
         char = characterization
         if char is None and characterization_loader is not None:
-            analyzer = DefenseAnalyzer(eval_model, n_samples=int(raw_config.get("characterization_samples", 50)), device=device, verbose=False)
+            thresholds = raw_config.get("characterization_thresholds")
+            if isinstance(thresholds, dict) and isinstance(
+                thresholds.get("defense_analyzer_threshold_overrides"), dict
+            ):
+                thresholds = thresholds["defense_analyzer_threshold_overrides"]
+            if thresholds is not None and not isinstance(thresholds, dict):
+                thresholds = None
+            analyzer = DefenseAnalyzer(
+                eval_model,
+                n_samples=int(raw_config.get("characterization_samples", 50)),
+                device=device,
+                verbose=False,
+                thresholds=thresholds,
+                volterra_gradient_source=str(raw_config.get("volterra_gradient_source", "pre_optimizer")),
+                volterra_optimizer=str(raw_config.get("volterra_optimizer", "sgd")),
+                volterra_optimizer_beta1=float(raw_config.get("volterra_optimizer_beta1", raw_config.get("volterra_optimizer_beta", 0.9))),
+                volterra_optimizer_beta2=float(raw_config.get("volterra_optimizer_beta2", 0.999)),
+                volterra_optimizer_eps=float(raw_config.get("volterra_optimizer_eps", 1e-8)),
+            )
             char = analyzer.characterize(characterization_loader, eps=cfg.epsilon)
 
         attack = self._select_attack(model, defense, cfg, char, device, raw_config)

@@ -1,6 +1,8 @@
 {
   "is_stub": true,
   "dataset": "imagenet100",
-  "reason": "Placeholder artifact (not a trained ImageNet-100 classifier)."
+  "reason": "Placeholder artifact (not a trained ImageNet-100 classifier).",
+  "sha256": "800695700294dda8a31266a708b5e436fd22edb7687beb014c9a6bf27ef555a6",
+  "torchscript_path": "models/imagenet100_resnet50.pt"
 }
 

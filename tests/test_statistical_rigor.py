@@ -48,50 +48,55 @@ def test_evaluate_seed_resolution_priority():
     assert _evaluate_cmd._resolve_seed_list({"seed": 3}, cli_seeds=(), num_seeds=3) == [3, 4, 5]
 
 
-def test_aggregate_results_across_seeds_mean_std():
-    s0 = {
-        "results": [
+def test_aggregate_results_across_seeds_mean_std_ci95():
+    # 5-seed run (paper-style): verify mean/std and 95% CI fields exist and are sensible.
+    seed_summaries = []
+    seeds = [0, 1, 2, 3, 4]
+    for i, s in enumerate(seeds):
+        asr = 0.1 + 0.1 * i  # [0.1, 0.2, 0.3, 0.4, 0.5]
+        rob = 0.9 - 0.1 * i  # [0.9, 0.8, 0.7, 0.6, 0.5]
+        seed_summaries.append(
             {
-                "defense": "jpeg",
-                "type": "jpeg",
-                "dataset": "cifar10",
-                "attacks": {
-                    "pgd": {
-                        "attack_success_rate": 0.1,
-                        "robust_accuracy": 0.9,
-                        "clean_accuracy": 0.95,
-                        "correct_samples": 100,
-                        "samples": 100,
+                "results": [
+                    {
+                        "defense": "jpeg",
+                        "type": "jpeg",
+                        "dataset": "cifar10",
+                        "attacks": {
+                            "pgd": {
+                                "attack_success_rate": asr,
+                                "robust_accuracy": rob,
+                                "clean_accuracy": 0.95,
+                                "correct_samples": 100,
+                                "samples": 100,
+                            }
+                        },
                     }
-                },
+                ]
             }
-        ]
-    }
-    s1 = {
-        "results": [
-            {
-                "defense": "jpeg",
-                "type": "jpeg",
-                "dataset": "cifar10",
-                "attacks": {
-                    "pgd": {
-                        "attack_success_rate": 0.3,
-                        "robust_accuracy": 0.7,
-                        "clean_accuracy": 0.90,
-                        "correct_samples": 90,
-                        "samples": 100,
-                    }
-                },
-            }
-        ]
-    }
+        )
 
-    agg = _evaluate_cmd._aggregate_results_across_seeds([s0, s1], seeds=[0, 1])
+    agg = _evaluate_cmd._aggregate_results_across_seeds(seed_summaries, seeds=seeds)
     assert len(agg) == 1
     metrics = agg[0]["attacks"]["pgd"]
 
-    assert math.isclose(float(metrics["attack_success_rate"]), 0.2, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(float(metrics["attack_success_rate_std"]), math.sqrt(0.02), rel_tol=1e-12, abs_tol=0.0)
-    assert int(metrics["attack_success_rate_n"]) == 2
-    assert metrics["attack_success_rate_by_seed"] == {"0": 0.1, "1": 0.3}
+    # Mean/std (sample) for [0.1,0.2,0.3,0.4,0.5]
+    assert math.isclose(float(metrics["attack_success_rate"]), 0.3, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(float(metrics["attack_success_rate_std"]), math.sqrt(0.025), rel_tol=0.0, abs_tol=1e-12)
+    assert int(metrics["attack_success_rate_n"]) == 5
+    assert metrics["attack_success_rate_by_seed"] == {"0": 0.1, "1": 0.2, "2": 0.3, "3": 0.4, "4": 0.5}
+
+    # 95% CI for mean uses t_{0.975,4} = 2.776
+    lo = float(metrics["attack_success_rate_ci95_low"])
+    hi = float(metrics["attack_success_rate_ci95_high"])
+    assert 0.0 <= lo <= 1.0
+    assert 0.0 <= hi <= 1.0
+    assert lo < float(metrics["attack_success_rate"]) < hi
+    assert math.isclose(lo, 0.103747, rel_tol=0.0, abs_tol=2e-4)
+    assert math.isclose(hi, 0.496253, rel_tol=0.0, abs_tol=2e-4)
+
+    # Spot-check robust accuracy CI is present and bounded.
+    assert int(metrics["robust_accuracy_n"]) == 5
+    assert 0.0 <= float(metrics["robust_accuracy_ci95_low"]) <= 1.0
+    assert 0.0 <= float(metrics["robust_accuracy_ci95_high"]) <= 1.0
 

@@ -281,19 +281,26 @@ class FABT(Attack):
         with torch.no_grad():
             logits = self.model(x)
             probs = F.softmax(logits, dim=1)
+            num_classes = int(probs.size(1)) if probs.ndim == 2 else 0
+        if num_classes <= 1:
+            raise ValueError("FABT requires a classifier with at least 2 classes.")
+
+        # Robustness: for small-C models (e.g., toy tests, binary classifiers),
+        # cap k so `topk(k)` is always valid.
+        k = min(int(self.n_target_classes), max(1, num_classes - 1))
 
         target_candidates = []
         for sample_idx in range(b):
             true_class = y[sample_idx].item()
             sample_probs = probs[sample_idx].clone()
             sample_probs[true_class] = -1
-            _, top_classes = sample_probs.topk(self.n_target_classes)
+            _, top_classes = sample_probs.topk(k)
             target_candidates.append(top_classes)
 
         best_adv = x.clone()
         best_norm = torch.full((b,), float("inf"), device=self.device)
 
-        for target_idx in range(self.n_target_classes):
+        for target_idx in range(k):
             targets = torch.stack([target_candidates[sample_idx][target_idx] for sample_idx in range(b)])
             x_adv_target = self.base_attack(x, y, targeted=True, target_classes=targets)
 

@@ -58,6 +58,8 @@ class AttentionSecurityConfig:
     contamination: str = 'auto'  # 'auto' or float-like string
     n_estimators: int = 256
     seed: int = 0
+    features: str = 'all'  # entropy_only|entropy_inj|spectral_only|all
+    anomaly_level: str = 'token'  # token|head
 
     title: str = 'NeurInSpectre — Attention Security Analysis'
 
@@ -157,6 +159,95 @@ def _attn_to_matrix(att: torch.Tensor) -> Optional[np.ndarray]:
     return None
 
 
+def _attn_to_heads(att: torch.Tensor) -> Optional[np.ndarray]:
+    """
+    Convert an attention-like tensor to (H,S,S) numpy matrix (batch index 0).
+    """
+    if att is None:
+        return None
+    t = att.detach()
+    if t.ndim == 4:
+        # (B,H,S,S)
+        return t[0].cpu().numpy()
+    if t.ndim == 3 and int(t.shape[1]) == int(t.shape[2]):
+        # (H,S,S) or (B,S,S). Ambiguous; treat as (H,S,S) when square.
+        return t.cpu().numpy()
+    return None
+
+
+def _attention_head_feature_matrix(att_heads: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[str]]:
+    """
+    Head-level attention features for per-head anomaly detection.
+
+    Args:
+        att_heads: (H,S,S) attention weights/probabilities.
+    """
+    A0 = np.asarray(att_heads, dtype=np.float64)
+    if A0.ndim != 3:
+        raise ValueError(f"Expected (H,S,S) attention tensor, got shape={A0.shape}")
+    H, S, S2 = A0.shape
+    if S != S2:
+        raise ValueError(f"Expected square attention matrices, got shape={A0.shape}")
+
+    eps = 1e-12
+    if float(A0.min()) < 0.0:
+        A0 = A0 - float(A0.min())
+
+    # Row-normalize per head: (H,S,S)
+    row = A0 / (A0.sum(axis=2, keepdims=True) + eps)
+
+    # Per-token measures (H,S)
+    ent = -(row * np.log(row + eps)).sum(axis=2)
+    row_max = row.max(axis=2)
+    diag = np.array([np.diag(row[h]) for h in range(int(H))], dtype=np.float64)
+    col_sum = row.sum(axis=1)
+
+    # Aggregate to head-level feature vectors (H, F)
+    entropy_mean = ent.mean(axis=1)
+    entropy_std = ent.std(axis=1)
+    row_max_mean = row_max.mean(axis=1)
+    row_max_std = row_max.std(axis=1)
+    diag_mean = diag.mean(axis=1)
+    diag_std = diag.std(axis=1)
+    col_sum_std = col_sum.std(axis=1)
+    col_sum_max = col_sum.max(axis=1)
+
+    names = [
+        "entropy_mean",
+        "entropy_std",
+        "row_max_mean",
+        "row_max_std",
+        "diag_mean",
+        "diag_std",
+        "col_sum_std",
+        "col_sum_max",
+    ]
+    X = np.column_stack(
+        [
+            entropy_mean,
+            entropy_std,
+            row_max_mean,
+            row_max_std,
+            diag_mean,
+            diag_std,
+            col_sum_std,
+            col_sum_max,
+        ]
+    )
+
+    per = {
+        "entropy_mean": entropy_mean,
+        "entropy_std": entropy_std,
+        "row_max_mean": row_max_mean,
+        "row_max_std": row_max_std,
+        "diag_mean": diag_mean,
+        "diag_std": diag_std,
+        "col_sum_std": col_sum_std,
+        "col_sum_max": col_sum_max,
+    }
+    return X, per, names
+
+
 def _aggregate_attention_matrix(
     *,
     attentions: List[torch.Tensor],
@@ -251,7 +342,12 @@ def _token_text_features(raw: str) -> List[float]:
     return [is_special, has_digit, has_upper, has_underscore, has_angle, has_equals, is_punct, length, has_susp]
 
 
-def _attention_feature_matrix(A: np.ndarray, raw_tokens: Sequence[str]) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+def _attention_feature_matrix(
+    A: np.ndarray,
+    raw_tokens: Sequence[str],
+    *,
+    feature_set: str = "all",
+) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[str]]:
     S = int(A.shape[0])
 
     A0 = np.array(A, dtype=np.float64)
@@ -271,8 +367,51 @@ def _attention_feature_matrix(A: np.ndarray, raw_tokens: Sequence[str]) -> Tuple
     col_max = row.max(axis=0)
 
     txt = np.array([_token_text_features(t) for t in raw_tokens], dtype=np.float64)
+    txt_names = [
+        "txt_is_special",
+        "txt_has_digit",
+        "txt_has_upper",
+        "txt_has_underscore",
+        "txt_has_angle",
+        "txt_has_equals",
+        "txt_is_punct",
+        "txt_length",
+        "txt_has_susp",
+    ]
 
-    X = np.column_stack([ent, row_max, diag, col_sum, col_max, txt])
+    groups: Dict[str, Tuple[np.ndarray, List[str]]] = {
+        "row_entropy": (ent, ["row_entropy"]),
+        "row_max": (row_max, ["row_max"]),
+        "diag": (diag, ["diag"]),
+        "col_sum": (col_sum, ["col_sum"]),
+        "col_max": (col_max, ["col_max"]),
+        "txt": (txt, list(txt_names)),
+    }
+
+    fs = str(feature_set or "all").strip().lower().replace("-", "_")
+    fs_map = {
+        "entropy_only": ["row_entropy"],
+        "entropy_inj": ["row_entropy", "txt"],
+        # "spectral_only" is interpreted here as "attention-only structure features"
+        # (no lexical/token-text cues).
+        "spectral_only": ["row_entropy", "row_max", "diag", "col_sum", "col_max"],
+        "all": ["row_entropy", "row_max", "diag", "col_sum", "col_max", "txt"],
+    }
+    use = fs_map.get(fs, fs_map["all"])
+
+    cols: List[np.ndarray] = []
+    names: List[str] = []
+    for key in use:
+        arr, nms = groups[key]
+        if arr.ndim == 1:
+            cols.append(arr)
+            names.extend(nms)
+        else:
+            for j in range(int(arr.shape[1])):
+                cols.append(arr[:, j])
+                names.append(nms[j] if j < len(nms) else f"{key}_{j}")
+
+    X = np.column_stack(cols) if cols else np.zeros((S, 0), dtype=np.float64)
 
     per = {
         'row_entropy': ent,
@@ -281,7 +420,7 @@ def _attention_feature_matrix(A: np.ndarray, raw_tokens: Sequence[str]) -> Tuple
         'col_sum': col_sum,
         'col_max': col_max,
     }
-    return X, per
+    return X, per, names
 
 
 def _isolation_forest_scores(
@@ -293,7 +432,11 @@ def _isolation_forest_scores(
 ) -> np.ndarray:
     n = int(X.shape[0])
     if n < 6:
-        v = X[:, 1]
+        # Small-n fallback: robust z-score on a stable feature column.
+        if X.ndim != 2 or int(X.shape[1]) <= 0:
+            return np.zeros((n,), dtype=np.float64)
+        col = 1 if int(X.shape[1]) > 1 else 0
+        v = X[:, col]
         med = float(np.median(v))
         mad = float(np.median(np.abs(v - med)) + 1e-9)
         z = np.abs((v - med) / mad)
@@ -445,28 +588,116 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
 
     A = A_full[start:end, start:end]
 
-    X, per = _attention_feature_matrix(A, tokens_raw)
-    scores = _isolation_forest_scores(
-        X,
-        contamination=str(cfg.contamination),
-        n_estimators=int(cfg.n_estimators),
-        seed=int(cfg.seed),
-    )
-    colors, orange_th, red_th = _score_to_colors(scores)
+    # Token-level attention features are always computed: they're used for
+    # heatmap callouts (attractors) and for the JSON artifact.
+    X_tok, per_tok, token_feature_names = _attention_feature_matrix(A, tokens_raw, feature_set=str(cfg.features))
 
-    findings = _summarize_findings(
-        tokens_clean=tokens_clean,
-        tokens_raw=tokens_raw,
-        scores=scores,
-        red_th=red_th,
-        col_sum=per['col_sum'],
-    )
+    level = str(getattr(cfg, "anomaly_level", "token") or "token").strip().lower()
+    if level not in {"token", "head"}:
+        level = "token"
+
+    head_samples: List[Dict[str, Any]] = []
+    head_feature_names: List[str] = []
+    scores: np.ndarray
+    feature_names: List[str]
+
+    if level == "head":
+        if not attentions:
+            raise RuntimeError("per-head anomaly mode requires real attentions (model returned none)")
+
+        layer_q = str(cfg.layer).strip().lower()
+        L = int(len(attentions))
+        if layer_q == "all":
+            s = 0 if cfg.layer_start is None else int(cfg.layer_start)
+            e = (L - 1) if cfg.layer_end is None else int(cfg.layer_end)
+            s = max(0, min(s, L - 1))
+            e = max(0, min(e, L - 1))
+            if e < s:
+                s, e = e, s
+            layer_idxs = list(range(s, e + 1))
+        else:
+            idx = max(0, min(int(layer_q), L - 1))
+            layer_idxs = [idx]
+
+        X_rows: List[np.ndarray] = []
+        for li in layer_idxs:
+            heads = _attn_to_heads(attentions[int(li)])
+            if heads is None:
+                continue
+            heads_w = heads[:, start:end, start:end]
+            X_h, _per_h, names_h = _attention_head_feature_matrix(heads_w)
+            if not head_feature_names:
+                head_feature_names = list(names_h)
+            for h in range(int(X_h.shape[0])):
+                head_samples.append({"layer": int(li), "head": int(h)})
+            X_rows.append(X_h)
+
+        if not X_rows:
+            raise RuntimeError("No usable per-head attention tensors extracted for selected layers")
+
+        X_head = np.vstack(X_rows).astype(np.float64, copy=False)
+        scores = _isolation_forest_scores(
+            X_head,
+            contamination=str(cfg.contamination),
+            n_estimators=int(cfg.n_estimators),
+            seed=int(cfg.seed),
+        )
+        feature_names = head_feature_names
+    else:
+        scores = _isolation_forest_scores(
+            X_tok,
+            contamination=str(cfg.contamination),
+            n_estimators=int(cfg.n_estimators),
+            seed=int(cfg.seed),
+        )
+        feature_names = token_feature_names
+
+    colors, orange_th, red_th = _score_to_colors(scores)
+    risk_max = float(np.max(scores)) if len(scores) else 0.0
+    topk = np.sort(np.asarray(scores, dtype=np.float64))[-3:] if len(scores) else np.asarray([], dtype=np.float64)
+    risk_top3_mean = float(np.mean(topk)) if topk.size else 0.0
+
+    if level == "head":
+        top_idx = [int(i) for i in np.argsort(scores)[-5:][::-1]] if len(scores) else []
+        findings = {
+            'security_findings': [
+                '[!] Per-head anomaly mode enabled: investigate outlier (layer, head) pairs and compare against a benign baseline.',
+            ],
+            'suspicious_heads': [
+                {
+                    'layer': int(head_samples[i]['layer']),
+                    'head': int(head_samples[i]['head']),
+                    'score': float(scores[i]),
+                }
+                for i in top_idx
+                if i < len(head_samples)
+            ],
+            'top_influencers': [],
+            'blue_team_next_steps': [
+                'Compare anomalous heads against a benign baseline prompt; prioritize heads that become newly red/orange.',
+                'If anomalies persist across many layers/heads, treat as higher-confidence prompt-hijack indicator.',
+                'Mitigate via input normalization and strict tool-call allowlists; reassess after mitigation.',
+            ],
+            'red_team_next_steps': [
+                'Authorized testing only: iterate delimiters/instruction framing; track which heads become persistent outliers.',
+                'A robust defense should prevent long-lived anomalous heads that consistently track attacker-controlled tokens.',
+            ],
+        }
+    else:
+        findings = _summarize_findings(
+            tokens_clean=tokens_clean,
+            tokens_raw=tokens_raw,
+            scores=scores,
+            red_th=red_th,
+            col_sum=per_tok['col_sum'],
+        )
 
     top_pairs = _top_attention_pairs(A, tokens_clean, k=10)
 
     # Salient indices for plot callouts (more useful than generic '!')
     top_anom_idx = [int(i) for i in np.argsort(scores)[-3:][::-1]] if len(scores) else []
-    top_attr_idx = [int(i) for i in np.argsort(per['col_sum'])[-3:][::-1]] if len(scores) else []
+    top_attr_idx = [int(i) for i in np.argsort(per_tok['col_sum'])[-3:][::-1]] if len(per_tok.get('col_sum', [])) else []
+    per = per_tok
 
     # --- Plot ---
     fig = plt.figure(figsize=(16, 9.4))
@@ -515,13 +746,19 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
         ax_hm.text(idx + 0.1, -0.6, f"A{k}", fontsize=8, color='#ff7f0e')
 
     # Bars
-    xs = np.arange(len(tokens_clean))
+    if level == "head":
+        bar_labels = [f"L{d['layer']}H{d['head']}" for d in head_samples]
+    else:
+        bar_labels = list(tokens_clean)
+
+    xs = np.arange(len(bar_labels))
     ax_bar.bar(xs, scores, color=colors, edgecolor='white', linewidth=0.6)
     ax_bar.set_ylim(0.0, max(1.05, float(np.max(scores) + 0.05)))
-    ax_bar.set_title('Token-Level Anomaly Scores')
+    ax_bar.set_title('Head-Level Anomaly Scores' if level == "head" else 'Token-Level Anomaly Scores')
     ax_bar.set_ylabel('Anomaly Score')
-    ax_bar.set_xticks(tick_idx)
-    ax_bar.set_xticklabels([tokens_clean[i] for i in tick_idx], rotation=45, ha='right')
+    tick_idx_bar = np.linspace(0, len(bar_labels) - 1, num=min(len(bar_labels), max_ticks), dtype=int) if bar_labels else np.asarray([], dtype=int)
+    ax_bar.set_xticks(tick_idx_bar)
+    ax_bar.set_xticklabels([bar_labels[int(i)] for i in tick_idx_bar], rotation=45, ha='right')
 
     ax_bar.axhline(red_th, color='#d62728', linestyle='--', linewidth=1.0)
     ax_bar.axhline(orange_th, color='#ff9f1a', linestyle=':', linewidth=1.0)
@@ -542,9 +779,10 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
             zorder=6,
         )
 
-    # Mark top attractors on x-axis
-    for idx in top_attr_idx:
-        ax_bar.scatter(idx, 0.0, marker='v', s=60, color='#666666', zorder=4)
+    # Mark top attractors on x-axis (token-mode only)
+    if level != "head":
+        for idx in top_attr_idx:
+            ax_bar.scatter(idx, 0.0, marker='v', s=60, color='#666666', zorder=4)
 
     # Compact legend
     try:
@@ -553,8 +791,11 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
             Line2D([0], [0], color='#d62728', lw=1.2, ls='--', label=f"red≥{red_th:.2f}"),
             Line2D([0], [0], color='#ff9f1a', lw=1.2, ls=':', label=f"orange≥{orange_th:.2f}"),
             Line2D([0], [0], marker='*', color='w', markerfacecolor='#111111', markeredgecolor='white', markersize=10, label='top anomalies'),
-            Line2D([0], [0], marker='v', color='w', markerfacecolor='#666666', markersize=7, label='top attractors'),
         ]
+        if level != "head":
+            handles.append(
+                Line2D([0], [0], marker='v', color='w', markerfacecolor='#666666', markersize=7, label='top attractors'),
+            )
         ax_bar.legend(handles=handles, loc='upper right', fontsize=8, frameon=False)
     except Exception:
         pass
@@ -568,7 +809,7 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
     fig.text(
         0.5,
         0.925,
-        f"Model: {resolved_name} | Layer: {layer_label} | Prompt: {prompt_one_line}",
+        f"Model: {resolved_name} | Layer: {layer_label} | Anomaly: {level} | Prompt: {prompt_one_line}",
         ha='center',
         va='top',
         fontsize=10,
@@ -580,9 +821,13 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
     if top_anom_idx:
         findings_lines.append('Top anomalies (★ on bar chart):')
         for r, idx in enumerate(top_anom_idx, start=1):
-            findings_lines.append(f"  #{r}: idx={idx} tok='{_short(tokens_clean[idx], 12)}' score={float(scores[idx]):.2f}")
+            if level == "head":
+                label = bar_labels[int(idx)] if int(idx) < len(bar_labels) else str(int(idx))
+                findings_lines.append(f"  #{r}: idx={idx} head='{label}' score={float(scores[idx]):.2f}")
+            else:
+                findings_lines.append(f"  #{r}: idx={idx} tok='{_short(tokens_clean[idx], 12)}' score={float(scores[idx]):.2f}")
     if top_attr_idx:
-        findings_lines.append('Top attractors (A# on heatmap / ▼ on bars):')
+        findings_lines.append('Top attractors (A# on heatmap):' if level == "head" else 'Top attractors (A# on heatmap / ▼ on bars):')
         for r, idx in enumerate(top_attr_idx, start=1):
             findings_lines.append(f"  A{r}: idx={idx} tok='{_short(tokens_clean[idx], 12)}' inbound={float(per['col_sum'][idx]):.3f}")
     if top_pairs:
@@ -649,11 +894,21 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
         'token_ids': [int(x) for x in ids_view],
         'anomaly': {
             'method': 'IsolationForest',
+            'level': str(level),
             'contamination': str(cfg.contamination),
             'n_estimators': int(cfg.n_estimators),
             'seed': int(cfg.seed),
+            'features': {
+                'set': ('head' if level == 'head' else str(cfg.features)),
+                'names': list(feature_names),
+            },
             'scores': [float(x) for x in scores],
             'thresholds': {'orange': float(orange_th), 'red': float(red_th)},
+            'head_samples': list(head_samples) if level == 'head' else [],
+        },
+        'risk': {
+            'score_max': float(risk_max),
+            'score_top3_mean': float(risk_top3_mean),
         },
         'attention_features': {
             'row_entropy': [float(x) for x in per['row_entropy']],
@@ -715,26 +970,44 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
         figp.update_yaxes(tickmode='array', tickvals=tick_vals, ticktext=tick_txt, row=1, col=1)
 
         # Bar chart with rich hover
-        cdata = np.column_stack([
-            np.array(tokens_clean, dtype=object),
-            np.array(tokens_raw, dtype=object),
-            np.array(scores, dtype=float),
-            np.array(per.get('row_entropy'), dtype=float),
-            np.array(per.get('row_max'), dtype=float),
-            np.array(per.get('col_sum'), dtype=float),
-        ])
+        if level == "head":
+            bar_x = [f"L{d['layer']}H{d['head']}" for d in head_samples]
+            cdata = np.column_stack(
+                [
+                    np.array([int(d["layer"]) for d in head_samples], dtype=int),
+                    np.array([int(d["head"]) for d in head_samples], dtype=int),
+                    np.array(scores, dtype=float),
+                ]
+            )
+            hovertemplate = (
+                "head=%{x}<br>layer=%{customdata[0]}<br>head=%{customdata[1]}<br>"
+                "score=%{customdata[2]:.3f}<extra></extra>"
+            )
+        else:
+            bar_x = xvals
+            cdata = np.column_stack(
+                [
+                    np.array(tokens_clean, dtype=object),
+                    np.array(tokens_raw, dtype=object),
+                    np.array(scores, dtype=float),
+                    np.array(per.get('row_entropy'), dtype=float),
+                    np.array(per.get('row_max'), dtype=float),
+                    np.array(per.get('col_sum'), dtype=float),
+                ]
+            )
+            hovertemplate = (
+                "idx=%{x}<br>clean=%{customdata[0]}<br>raw=%{customdata[1]}<br>"
+                "score=%{customdata[2]:.3f}<br>row_entropy=%{customdata[3]:.3f}<br>"
+                "row_max=%{customdata[4]:.3f}<br>inbound(col_sum)=%{customdata[5]:.3f}<extra></extra>"
+            )
 
         figp.add_trace(
             go.Bar(
-                x=xvals,
+                x=bar_x,
                 y=[float(x) for x in scores],
                 marker_color=list(colors),
                 customdata=cdata,
-                hovertemplate=(
-                    "idx=%{x}<br>clean=%{customdata[0]}<br>raw=%{customdata[1]}<br>" +
-                    "score=%{customdata[2]:.3f}<br>row_entropy=%{customdata[3]:.3f}<br>" +
-                    "row_max=%{customdata[4]:.3f}<br>inbound(col_sum)=%{customdata[5]:.3f}<extra></extra>"
-                ),
+                hovertemplate=hovertemplate,
                 name='Anomaly score',
             ),
             row=1,
@@ -747,7 +1020,7 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
 
         # Top anomalies markers (ranked)
         if top_anom_idx:
-            xs = [start + int(i) for i in top_anom_idx]
+            xs = [bar_x[int(i)] for i in top_anom_idx]
             ys = [float(scores[int(i)]) for i in top_anom_idx]
             figp.add_trace(
                 go.Scatter(
@@ -766,26 +1039,27 @@ def generate_attention_security_analysis(cfg: AttentionSecurityConfig) -> Tuple[
 
         # Top attractors markers and heatmap vlines
         if top_attr_idx:
-            xs = [start + int(i) for i in top_attr_idx]
-            figp.add_trace(
-                go.Scatter(
-                    x=xs,
-                    y=[0.0 for _ in xs],
-                    mode='markers',
-                    marker=dict(symbol='triangle-down', size=11, color='#666666'),
-                    name='Top attractors',
-                    hovertemplate='attractor idx=%{x}<extra></extra>',
-                ),
-                row=1,
-                col=2,
-            )
             for i in top_attr_idx:
                 figp.add_vline(x=start + int(i), line_dash='dash', line_color='#ff7f0e', line_width=1.0, row=1, col=1)
+            if level != "head":
+                xs = [start + int(i) for i in top_attr_idx]
+                figp.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=[0.0 for _ in xs],
+                        mode='markers',
+                        marker=dict(symbol='triangle-down', size=11, color='#666666'),
+                        name='Top attractors',
+                        hovertemplate='attractor idx=%{x}<extra></extra>',
+                    ),
+                    row=1,
+                    col=2,
+                )
 
         # Axis titles
         figp.update_xaxes(title_text='Key token index', row=1, col=1)
         figp.update_yaxes(title_text='Query token index', row=1, col=1)
-        figp.update_xaxes(title_text='Token index', row=1, col=2)
+        figp.update_xaxes(title_text=('Head (layer/head)' if level == 'head' else 'Token index'), row=1, col=2)
         figp.update_yaxes(title_text='Anomaly score', row=1, col=2)
 
         figp.update_layout(
@@ -895,6 +1169,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument('--contamination', default='auto', help="IsolationForest contamination ('auto' or float)")
     p.add_argument('--n-estimators', type=int, default=256, help='IsolationForest n_estimators (default: 256)')
     p.add_argument('--seed', type=int, default=0, help='Random seed (default: 0)')
+    p.add_argument(
+        '--features',
+        choices=['entropy_only', 'entropy_inj', 'spectral_only', 'all'],
+        default='all',
+        help='Feature set for IsolationForest (default: all)',
+    )
+    p.add_argument(
+        '--anomaly-level',
+        choices=['token', 'head'],
+        default='token',
+        help="Anomaly scoring unit: 'token' (default) or 'head' (per layer-head)",
+    )
 
     p.add_argument('--title', default='NeurInSpectre — Attention Security Analysis', help='Plot title')
 
@@ -925,6 +1211,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         contamination=str(args.contamination),
         n_estimators=int(args.n_estimators),
         seed=int(args.seed),
+        features=str(getattr(args, 'features', 'all')),
+        anomaly_level=str(getattr(args, 'anomaly_level', 'token')),
         title=str(args.title),
     )
 

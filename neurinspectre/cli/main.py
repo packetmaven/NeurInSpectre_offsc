@@ -32,9 +32,12 @@ _CLICK_COMMANDS = {
     "attack",
     "analyze",
     "baselines",
+    "calibrate-thresholds",
     "characterize",
     "defense-analyzer",
     "doctor",
+    "mitre-atlas",
+    "drift-detect",
     "evaluate",
     "figures",
     "table2",
@@ -147,6 +150,7 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
             "spatial_smoothing",
             "random_pad_crop",
             "rl_obfuscation",
+            "tent",
             "certified_defense",
             "custom",
         ]
@@ -158,6 +162,11 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     "--defense-config",
     type=click.Path(exists=True),
     help="Path to defense configuration YAML",
+)
+@click.option(
+    "--threshold-overrides",
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON file with DefenseAnalyzer threshold overrides (e.g., from calibrate-thresholds)",
 )
 @click.option(
     "--attack-type",
@@ -204,6 +213,20 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     type=int,
     default=None,
     help="Override memory length k (otherwise use characterization-recommended value)",
+)
+@click.option(
+    "--volterra-gradient-source",
+    type=click.Choice(["pre_optimizer", "post_optimizer"]),
+    default="pre_optimizer",
+    show_default=True,
+    help="Gradient source used when fitting Volterra alpha during Phase 1 characterization (confound control)",
+)
+@click.option(
+    "--volterra-optimizer",
+    type=click.Choice(["sgd", "sgd_momentum", "adam", "rmsprop"]),
+    default="sgd",
+    show_default=True,
+    help="Optimizer model used only when --volterra-gradient-source=post_optimizer",
 )
 @click.option(
     "--epsilon",
@@ -300,6 +323,12 @@ def cli(ctx: click.Context, verbose: int, quiet: bool) -> None:
     "--save-adversarials",
     type=click.Path(),
     help="Save adversarial examples to directory",
+)
+@click.option(
+    "--save-features",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Optional features artifact path (JSONL). Writes one record with detector/characterization features + attack summary.",
 )
 @click.option(
     "--device",
@@ -458,6 +487,26 @@ def attack_cmd(ctx: click.Context, **kwargs) -> None:
     type=int,
     default=42,
     help="Random seed for reproducibility",
+)
+@click.option(
+    "--volterra-gradient-source",
+    type=click.Choice(["pre_optimizer", "post_optimizer"]),
+    default="pre_optimizer",
+    show_default=True,
+    help="Gradient source used when fitting Volterra alpha during Phase 1 characterization (confound control)",
+)
+@click.option(
+    "--volterra-optimizer",
+    type=click.Choice(["sgd", "sgd_momentum", "adam", "rmsprop"]),
+    default="sgd",
+    show_default=True,
+    help="Optimizer model used only when --volterra-gradient-source=post_optimizer",
+)
+@click.option(
+    "--save-features",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Optional features artifact path (JSONL). Writes one record with detector/characterization features + attack summary.",
 )
 @click.pass_context
 def analyze_cmd(ctx: click.Context, **kwargs) -> None:
@@ -639,6 +688,8 @@ def analyze_cmd(ctx: click.Context, **kwargs) -> None:
             "at_transform",
             "spatial_smoothing",
             "random_pad_crop",
+            "rl_obfuscation",
+            "tent",
             "certified_defense",
             "custom",
         ]
@@ -650,6 +701,11 @@ def analyze_cmd(ctx: click.Context, **kwargs) -> None:
     "--defense-config",
     type=click.Path(exists=True),
     help="Path to defense configuration",
+)
+@click.option(
+    "--threshold-overrides",
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON file with DefenseAnalyzer threshold overrides (e.g., from calibrate-thresholds)",
 )
 @click.option(
     "--use-bpda-approx",
@@ -668,6 +724,20 @@ def analyze_cmd(ctx: click.Context, **kwargs) -> None:
     type=int,
     default=100,
     help="Number of samples for characterization",
+)
+@click.option(
+    "--volterra-gradient-source",
+    type=click.Choice(["pre_optimizer", "post_optimizer"]),
+    default="pre_optimizer",
+    show_default=True,
+    help="Gradient source used when fitting Volterra alpha (confound control)",
+)
+@click.option(
+    "--volterra-optimizer",
+    type=click.Choice(["sgd", "sgd_momentum", "adam", "rmsprop"]),
+    default="sgd",
+    show_default=True,
+    help="Optimizer model used only when --volterra-gradient-source=post_optimizer",
 )
 @click.option(
     "--output",
@@ -963,7 +1033,7 @@ def compare_cmd(ctx: click.Context, **kwargs) -> None:
     "--seeds",
     multiple=True,
     type=int,
-    help="Run 3-5 independent seeds and report mean ± std (repeat flag)",
+    help="Run independent seeds and report mean ± std + 95% CI (repeat flag; recommend >=5 for paper tables)",
 )
 @click.option(
     "--num-seeds",
@@ -1049,6 +1119,12 @@ def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
     type=click.Path(),
     default="results/table2",
     help="Output directory for all results",
+)
+@click.option(
+    "--thresholds",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Optional JSON thresholds/overrides (from calibrate-thresholds) applied during Phase 1 characterization",
 )
 @click.option(
     "--strict-real-data/--no-strict-real-data",
@@ -1143,7 +1219,7 @@ def evaluate_cmd(ctx: click.Context, **kwargs) -> None:
     "--seeds",
     multiple=True,
     type=int,
-    help="Run 3-5 independent seeds and report mean ± std (repeat flag)",
+    help="Run independent seeds and report mean ± std + 95% CI (repeat flag; recommend >=5 for paper tables)",
 )
 @click.option(
     "--num-seeds",
@@ -1313,6 +1389,46 @@ def doctor_cli_cmd(ctx: click.Context, **kwargs) -> None:
     run_doctor(ctx, **kwargs)
 
 
+@cli.command("drift-detect")
+@click.option("--reference", "-r", required=True, type=click.Path(exists=True), help="Reference data (.npy/.npz)")
+@click.option("--current", "-c", required=True, type=click.Path(exists=True), help="Current data (.npy/.npz)")
+@click.option(
+    "--methods",
+    default="hotelling,ks,bayesian",
+    show_default=True,
+    help="Comma-separated methods: hotelling, ks, mmd, ks_ad_cvm, bayesian",
+)
+@click.option("--confidence-level", type=float, default=0.95, show_default=True, help="Confidence level")
+@click.option("--output", "-o", type=click.Path(), help="Write JSON results to this path (otherwise prints JSON)")
+@click.option("--plot", type=click.Path(), help="Optional PNG plot path for a drift summary visualization")
+@click.option("--plot-feature-index", type=int, default=0, show_default=True, help="Feature index to plot (default: 0)")
+def drift_detect_cmd(
+    reference: str,
+    current: str,
+    methods: str,
+    confidence_level: float,
+    output: str | None,
+    plot: str | None,
+    plot_feature_index: int,
+) -> None:
+    """Multivariate drift detection (Hotelling / KS / MMD / Bayesian CP)."""
+    from .drift_detect_cmd import run_drift_detect
+
+    payload, out_path = run_drift_detect(
+        reference=reference,
+        current=current,
+        methods=methods,
+        confidence_level=confidence_level,
+        output=output,
+        plot=plot,
+        plot_feature_index=plot_feature_index,
+    )
+    if out_path:
+        click.echo(str(out_path))
+    else:
+        click.echo(payload)
+
+
 @cli.command("config")
 @click.argument("config_type", type=click.Choice(["attack", "defense", "evaluation"]))
 @click.option("--output", "-o", type=click.Path(), help="Output file (default: stdout)")
@@ -1344,10 +1460,20 @@ from .baselines_cmd import baselines_cmd as baselines_cli_cmd  # noqa: E402
 
 cli.add_command(baselines_cli_cmd)
 
+# Tier 2: ROC/AUC threshold calibration.
+from .calibrate_thresholds_cmd import calibrate_thresholds_cmd as calibrate_thresholds_cli_cmd  # noqa: E402
+
+cli.add_command(calibrate_thresholds_cli_cmd)
+
 # Paper figure generation (Issue: paper figures -> reproducible CLI).
 from .figures_cmd import figures_cmd as figures_cli_cmd  # noqa: E402
 
 cli.add_command(figures_cli_cmd)
+
+# MITRE ATLAS validation/coverage (Tier 2 rigor; offline STIX).
+from .mitre_atlas_cmd import mitre_atlas_cmd as mitre_atlas_cli_cmd  # noqa: E402
+
+cli.add_command(mitre_atlas_cli_cmd)
 
 
 def main() -> None:
@@ -1368,6 +1494,8 @@ def main() -> None:
                 "attention-security",
                 "adversarial-ednn",
                 "subnetwork_hijack",
+                "activation_steganography",
+                "activation-steganography",
                 "statistical_evasion",
                 "statistical-evasion",
                 # Debug/infra helpers in legacy CLI

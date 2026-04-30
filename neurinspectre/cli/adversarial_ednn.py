@@ -80,6 +80,21 @@ def run_ednn(args):
     config.device = dev_pref
     config.verbose = args.verbose
     config.output_dir = args.output_dir
+    # Tier 2 ablations: dimension selection controls
+    config.dim_selection = str(getattr(args, "dim_selection", "all") or "all")
+    try:
+        config.dim_top_frac = float(getattr(args, "dim_top_frac", config.dim_top_frac))
+    except Exception:
+        pass
+    try:
+        dtk = getattr(args, "dim_top_k", None)
+        config.dim_top_k = int(dtk) if dtk is not None else None
+    except Exception:
+        config.dim_top_k = None
+    try:
+        config.dim_selection_seed = int(getattr(args, "seed", config.dim_selection_seed))
+    except Exception:
+        pass
 
     # Load embedding model/tokenizer when required (no synthetic/demo fallback)
     needs_model = args.attack_type in ("inversion", "steganographic", "rag_poison")

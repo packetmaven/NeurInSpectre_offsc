@@ -37,5 +37,11 @@ RUN python3 -m pip install --upgrade pip setuptools wheel && \
 # Verify installation (no network; best-effort inventory).
 RUN neurinspectre doctor
 
+# NOTE: The .dockerignore excludes data/ and models/ for image size.
+# Mount them at runtime:
+#   docker run --gpus all --rm -it \
+#     -v /path/to/data:/app/data \
+#     -v /path/to/models:/app/models \
+#     neurinspectre:ae table2 --config table2_config.yaml --strict-real-data
 ENTRYPOINT ["neurinspectre"]
 

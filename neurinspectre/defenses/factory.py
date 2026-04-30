@@ -24,6 +24,7 @@ from .wrappers import (
     RandomNoiseDefense,
     RandomPadCropDefense,
     SpatialSmoothingDefense,
+    TentDefense,
     ThermometerEncodingDefense,
     TotalVariationDefense,
 )
@@ -76,7 +77,8 @@ class DefenseFactory:
             )
         if key == "certified_defense":
             sigma = float(params.get("sigma", 0.5))
-            return CertifiedDefense(base_model, sigma=sigma, device=device)
+            n_samples = int(params.get("n_samples", params.get("num_samples", 100)))
+            return CertifiedDefense(base_model, sigma=sigma, n_samples=n_samples, device=device)
         if key == "random_noise":
             return RandomNoiseDefense(base_model, std=float(params.get("std", 0.05)), device=device)
         if key == "rl_obfuscation":
@@ -86,6 +88,14 @@ class DefenseFactory:
                 std=float(params.get("std", 0.08)),
                 alpha=float(params.get("alpha", 0.60)),
                 n_samples=int(params.get("n_samples", 32)),
+                device=device,
+            )
+        if key == "tent":
+            return TentDefense(
+                base_model,
+                lr=float(params.get("lr", 1e-3)),
+                steps=int(params.get("steps", 1)),
+                reset_each_forward=bool(params.get("reset_each_forward", False)),
                 device=device,
             )
         if key == "total_variation":
@@ -127,6 +137,13 @@ def _ensemble_diversity_defense(base_model: nn.Module, params: Dict[str, Any], d
         models.append(model)
 
     aggregation = params.get("aggregation", params.get("voting", "average"))
+    # Config ergonomics: paper/spec configs often say "majority" voting.
+    # The runnable defense uses "vote" (argmax majority vote over members).
+    agg_norm = str(aggregation).lower().strip().replace("-", "_")
+    if agg_norm in {"majority", "majority_vote", "plurality"}:
+        aggregation = "vote"
+    elif agg_norm in {"avg", "mean"}:
+        aggregation = "average"
     return EnsembleDiversityDefense(models=models, aggregation=aggregation, device=device)
 
 

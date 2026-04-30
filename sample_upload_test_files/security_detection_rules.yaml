@@ -1,5 +1,5 @@
 metadata:
-  author: packetmaven
+  author: NeurInSpectre Security Team
   version: '1.0'
 rules:
 - category: execution

@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 def resolve_validity_gates(
     config: Dict[str, Any],
     *,
-    default_enabled: bool = False,
+    default_enabled: bool = True,
     default_strict: bool = False,
 ) -> Dict[str, Any]:
     raw = dict(config.get("validity_gates", {}) or {})

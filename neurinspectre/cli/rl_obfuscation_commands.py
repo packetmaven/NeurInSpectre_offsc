@@ -62,6 +62,17 @@ def add_rl_obfuscation_parser(subparsers):
     analyze_parser.add_argument('--output-plot', help='Output visualization file')
     analyze_parser.add_argument('--metadata', help='Additional metadata JSON file')
     analyze_parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    analyze_parser.add_argument(
+        '--srl-weights',
+        default=None,
+        help='Optional JSON file containing SRL logistic-regression weights (coef/intercept or weights/bias)',
+    )
+    analyze_parser.add_argument(
+        '--srl-threshold',
+        type=float,
+        default=None,
+        help='Optional SRL decision threshold override (default: weights file threshold or 0.6)',
+    )
     
     # Batch analysis
     batch_parser = rl_subparsers.add_parser(
@@ -171,7 +182,12 @@ def handle_single_analysis(args):
             print(f"⚠️  Warning: Failed to load metadata: {e}")
     
     # Initialize detector
-    detector = CriticalRLObfuscationDetector(sensitivity_level=args.sensitivity)
+    detector = CriticalRLObfuscationDetector(
+        sensitivity_level=args.sensitivity,
+        verbose=bool(args.verbose),
+        srl_weights_path=getattr(args, "srl_weights", None),
+        srl_threshold=getattr(args, "srl_threshold", None),
+    )
     
     # Analyze gradient
     if args.verbose:

@@ -1,0 +1,25 @@
+{
+  "dataset": "ember",
+  "checkpoint_tag": "md_gradient_reg_ember",
+  "variant": "gradient_regularization",
+  "input_dim": 2381,
+  "num_classes": 2,
+  "seed": 42,
+  "device": "mps",
+  "train_samples": 100000,
+  "val_samples": 20000,
+  "lr": 0.001,
+  "epochs": 2,
+  "lambda_grad": 0.1,
+  "val_acc": 0.51245,
+  "train_stats": {
+    "epochs": 2.0,
+    "last_loss": 0.5818397402763367
+  },
+  "sha256": "16e8741aeb0f8d1a7100c3a377b9f79aa87ab800c81d8b80a442543f1154500b",
+  "torch_version": "2.10.0",
+  "elapsed_seconds": 26.80054497718811,
+  "torchscript_path": "models/md_gradient_reg_ember_ts.pt",
+  "state_dict_path": "models/checkpoints/md_gradient_reg_ember.pt",
+  "init_from": "standard_teacher"
+}

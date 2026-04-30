@@ -22,6 +22,7 @@ Version: 2.0.1 (WOOT 2026 submission aligned - all issues resolved)
 from __future__ import annotations
 
 import logging
+import json
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -37,6 +38,7 @@ from .utils import (
     evaluate_attack_runner,
     load_dataset,
     load_model,
+    load_threshold_overrides,
     load_yaml,
     resolve_device,
     save_json,
@@ -440,6 +442,14 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
     iterations = int(kwargs.get("iterations", 100))
     targeted = bool(kwargs.get("targeted", False))
 
+    threshold_overrides: Optional[Dict[str, Any]] = None
+    threshold_overrides_path = kwargs.get("threshold_overrides")
+    if threshold_overrides_path:
+        try:
+            threshold_overrides = load_threshold_overrides(str(threshold_overrides_path))
+        except Exception as exc:
+            raise click.ClickException(f"Failed to load --threshold-overrides: {exc}") from exc
+
     if targeted and attack_type == "neurinspectre":
         click.echo(
             "Targeted mode not supported for adaptive attack; "
@@ -469,7 +479,13 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
         # Volterra memory control (Issue 6: decisive experiment plumbing)
         "volterra_mode": str(kwargs.get("volterra_mode", "auto")),
         "volterra_kernel": str(kwargs.get("volterra_kernel", "power_law")),
+        # Tier 2: optimizer-confound control for Volterra alpha fitting.
+        "volterra_gradient_source": str(kwargs.get("volterra_gradient_source", "pre_optimizer")),
+        "volterra_optimizer": str(kwargs.get("volterra_optimizer", "sgd")),
     }
+    if threshold_overrides:
+        # Passed through to DefenseAnalyzer during Phase 1 characterization.
+        attack_config["characterization_thresholds"] = dict(threshold_overrides)
     if kwargs.get("volterra_alpha") is not None:
         attack_config["alpha_volterra"] = float(kwargs["volterra_alpha"])
     if kwargs.get("volterra_memory_length") is not None:
@@ -670,6 +686,58 @@ def run_attack(ctx: click.Context, **kwargs: Any) -> None:
     output_path = Path(kwargs.get("output", "attack_results.json"))
     save_json(output, output_path)
     click.echo(f"Attack results written to {output_path}")
+
+    # Optional Tier 2 artifact: persist a compact feature row for calibration / audit.
+    save_features_path = kwargs.get("save_features")
+    if save_features_path:
+        try:
+            from datetime import datetime
+
+            meta = characterization_dict.get("metadata") if isinstance(characterization_dict, dict) else {}
+            meta = meta if isinstance(meta, dict) else {}
+            feature_row = {
+                "kind": "attack_features",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "attack": str(attack_type),
+                "defense": str(defense_name),
+                "dataset": str(dataset_name),
+                "epsilon": float(epsilon),
+                "norm": str(norm),
+                "seed": int(seed),
+                "iterations": int(iterations),
+                "num_samples": int(num_samples) if num_samples is not None else None,
+                "batch_size": int(batch_size),
+                "results": {
+                    "attack_success_rate": float(summary.get("attack_success_rate", 0.0)),
+                    "robust_accuracy": float(summary.get("robust_accuracy", 0.0)),
+                    "clean_accuracy": float(summary.get("clean_accuracy", 0.0)),
+                    "samples": int(summary.get("samples", 0) or 0),
+                    "correct_samples": int(summary.get("correct_samples", 0) or 0),
+                    "queries_mean": summary.get("queries"),
+                    "iterations_mean": summary.get("iterations"),
+                },
+                # Keep the full characterization for traceability.
+                "characterization": characterization_dict,
+                # Mirror a few scalar "detector" features at top-level for easy parsing.
+                "detector_features": {
+                    "etd_score": characterization_dict.get("etd_score") if isinstance(characterization_dict, dict) else None,
+                    "alpha_volterra": characterization_dict.get("alpha_volterra") if isinstance(characterization_dict, dict) else None,
+                    "jacobian_rank": characterization_dict.get("jacobian_rank") if isinstance(characterization_dict, dict) else None,
+                    "gradient_variance": characterization_dict.get("gradient_variance") if isinstance(characterization_dict, dict) else None,
+                    "spectral_entropy_norm": meta.get("spectral_entropy_norm"),
+                    "high_freq_ratio": meta.get("high_freq_ratio"),
+                    "volterra_rmse_scaled": meta.get("volterra_rmse_scaled"),
+                    "confidence": characterization_dict.get("confidence") if isinstance(characterization_dict, dict) else None,
+                },
+            }
+
+            p = Path(str(save_features_path))
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(feature_row, sort_keys=True) + "\n")
+            click.echo(f"Features row appended to {p}")
+        except Exception as exc:
+            raise click.ClickException(f"Failed to write --save-features artifact: {exc}") from exc
 
     # -------------------------------------------------------------------
     # 8. Render report
