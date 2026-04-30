@@ -14,4 +14,4 @@ python-stix2>=3.0.0  # STIX 2.1 validation (optional)
 
 # Additional security libraries (optional)
 cryptography>=41.0.0  # For encrypted data handling
-requests>=2.31.0      # For TAXII protocol support
+requests>=2.33.0      # For TAXII protocol support
